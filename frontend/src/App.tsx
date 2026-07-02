@@ -54,6 +54,9 @@ export default function App() {
   const [videoMeta, setVideoMeta] = useState<VideoMetadata | null>(null);
   const [clickFrame, setClickFrame] = useState<number>(0);
   const [clicks, setClicks] = useState<DancerClick[]>([]);
+  // The frame ALL clicks are bound to. Clicks and key_frame must agree, so
+  // clicking on a different frame restarts the click set on that frame.
+  const [seedFrame, setSeedFrame] = useState<number | null>(null);
   const [submittingClicks, setSubmittingClicks] = useState(false);
   const [references, setReferences] = useState<ReferenceFile[]>([]);
   const [referenceFilename, setReferenceFilename] = useState<string>('reference.mp4');
@@ -192,6 +195,16 @@ export default function App() {
     setStatus(null);
     setPositions(null);
     setFrameIndex(0);
+    // Clear everything belonging to the previous job — stale selections or
+    // comparison results must never carry across uploads (a leftover
+    // selectedIds pair could fire a merge with the old job's track ids).
+    setSelectedIds([]);
+    setCompareResult(null);
+    setLabels({});
+    setLabelDraft({});
+    setClicks([]);
+    setClickFrame(0);
+    setSeedFrame(null);
 
     const formData = new FormData();
     formData.append('file', file);
@@ -220,6 +233,7 @@ export default function App() {
       if (data.status === 'awaiting_clicks') {
         setClickFrame(0);
         setClicks([]);
+        setSeedFrame(null);
         setPhase('awaiting_clicks');
       } else {
         setPhase('processing');
@@ -229,6 +243,25 @@ export default function App() {
       setError(err instanceof Error ? err.message : String(err));
       setPhase('failed');
     }
+  }
+
+  function handleAddClick(c: DancerClick) {
+    // Clicks are only valid on the frame they were made on. First click pins
+    // the seed frame; clicking on a different frame restarts the click set
+    // there (coords from one frame + key_frame from another would seed the
+    // trackers on the wrong dancers).
+    if (seedFrame === null || clicks.length === 0) {
+      setSeedFrame(clickFrame);
+      setClicks([c]);
+      return;
+    }
+    if (clickFrame !== seedFrame) {
+      setSeedFrame(clickFrame);
+      setClicks([c]);
+      setError(null);
+      return;
+    }
+    setClicks((prev) => [...prev, c]);
   }
 
   async function handleSubmitClicks() {
@@ -248,7 +281,9 @@ export default function App() {
       const resp = await fetch(`${API_BASE}/jobs/${jobId}/clicks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key_frame: clickFrame, clicks: cleaned }),
+        // key_frame is the frame the clicks were MADE on, not the scrubber's
+        // current position.
+        body: JSON.stringify({ key_frame: seedFrame ?? clickFrame, clicks: cleaned }),
       });
       if (!resp.ok) {
         const detail = await resp.text();
@@ -515,7 +550,8 @@ export default function App() {
           frame={clickFrame}
           onFrameChange={setClickFrame}
           clicks={clicks}
-          onAddClick={(c) => setClicks((prev) => [...prev, c])}
+          seedFrame={seedFrame}
+          onAddClick={handleAddClick}
           onUpdateClick={(idx, partial) =>
             setClicks((prev) =>
               prev.map((c, i) => (i === idx ? { ...c, ...partial } : c)),
@@ -537,7 +573,7 @@ export default function App() {
               {positions.summary.unique_track_ids} · Max dancers per frame:{' '}
               {positions.summary.max_dancers_in_frame}
             </span>
-            {jobId && (
+            {jobId && status?.debug_video_available && (
               <a
                 href={`${API_BASE}/jobs/${jobId}/debug-video`}
                 target="_blank"
@@ -867,6 +903,7 @@ function ClickPicker({
   frame,
   onFrameChange,
   clicks,
+  seedFrame,
   onAddClick,
   onUpdateClick,
   onRemoveClick,
@@ -878,6 +915,7 @@ function ClickPicker({
   frame: number;
   onFrameChange: (n: number) => void;
   clicks: DancerClick[];
+  seedFrame: number | null;
   onAddClick: (c: DancerClick) => void;
   onUpdateClick: (idx: number, partial: Partial<DancerClick>) => void;
   onRemoveClick: (idx: number) => void;
@@ -885,6 +923,18 @@ function ClickPicker({
   submitting: boolean;
 }) {
   const imgRef = useRef<HTMLImageElement | null>(null);
+  // The slider updates a local value on every tick; the actual frame (which
+  // triggers a backend video-decode per change) commits after a short pause,
+  // so dragging doesn't fire hundreds of frame-extraction requests.
+  const [sliderValue, setSliderValue] = useState(frame);
+  useEffect(() => {
+    setSliderValue(frame);
+  }, [frame]);
+  useEffect(() => {
+    if (sliderValue === frame) return;
+    const t = window.setTimeout(() => onFrameChange(sliderValue), 200);
+    return () => window.clearTimeout(t);
+  }, [sliderValue, frame, onFrameChange]);
   const lastFrameUrl = useMemo(
     () => `${API_BASE}/jobs/${jobId}/frame-jpeg?n=${frame}`,
     [jobId, frame],
@@ -946,10 +996,25 @@ function ClickPicker({
       <div className="click-picker-header">
         <strong>Click each dancer, then name them.</strong>
         <span>
-          Each click follows that dancer for all {videoMeta.frame_count} frames.
-          <strong> Shift+Click</strong> adds a second point on the most-recently-named
-          dancer (e.g. head + torso) — useful when they get occluded behind another dancer.
+          Tracking runs from the clicked frame <strong>forward</strong> — pick a frame
+          near the start where every dancer is visible. Frames before your click frame
+          won't be tracked. <strong>Shift+Click</strong> adds a second point on the
+          most-recently-named dancer (e.g. head + torso) — useful when they get
+          occluded behind another dancer. All clicks must be on the same frame;
+          clicking on a different frame restarts the set there.
         </span>
+        {seedFrame !== null && (
+          <span className="seed-frame-note">
+            Seeding on frame {seedFrame}
+            {seedFrame > videoMeta.frame_count * 0.1 && (
+              <strong>
+                {' '}
+                — warning: the first {(seedFrame / Math.max(videoMeta.fps, 1)).toFixed(1)}s
+                of the video will have no tracking. Consider an earlier frame.
+              </strong>
+            )}
+          </span>
+        )}
       </div>
 
       <div className="click-picker-stage">
@@ -990,11 +1055,11 @@ function ClickPicker({
           type="range"
           min={0}
           max={Math.max(videoMeta.frame_count - 1, 0)}
-          value={frame}
-          onChange={(e) => onFrameChange(Number(e.target.value))}
+          value={sliderValue}
+          onChange={(e) => setSliderValue(Number(e.target.value))}
         />
         <span>
-          Frame {frame} / {videoMeta.frame_count - 1}
+          Frame {sliderValue} / {videoMeta.frame_count - 1}
         </span>
       </div>
 

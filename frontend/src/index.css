@@ -400,6 +400,16 @@ header p {
   font-size: 0.85rem;
 }
 
+.seed-frame-note {
+  color: #c8d0dc;
+  font-size: 0.85rem;
+}
+
+.seed-frame-note strong {
+  color: #ffb44a;
+  font-weight: 600;
+}
+
 .click-picker-stage {
   position: relative;
   width: 100%;

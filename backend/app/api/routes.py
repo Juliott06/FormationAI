@@ -259,7 +259,13 @@ def get_frame_jpeg(job_id: str, n: int = 0) -> Response:
         jpeg = store.extract_frame_jpeg(job_id, n)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return Response(content=jpeg, media_type="image/jpeg")
+    # A given (job, frame) never changes — let the browser cache it so scrubbing
+    # back over visited frames doesn't re-hit the video decoder.
+    return Response(
+        content=jpeg,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=86400, immutable"},
+    )
 
 
 @router.post("/jobs/{job_id}/clicks", response_model=JobStatusResponse)
@@ -340,6 +346,9 @@ def get_job_status(job_id: str) -> JobStatusResponse:
     if job.status == "completed":
         progress = 1.0
 
+    debug_available = (
+        job.status == "completed" and store.find_debug_video(job_id) is not None
+    )
     return JobStatusResponse(
         job_id=job.job_id,
         status=job.status,
@@ -349,6 +358,7 @@ def get_job_status(job_id: str) -> JobStatusResponse:
         error=job.error,
         video_meta=job.video_meta,
         expected_dancer_count=job.expected_dancer_count,
+        debug_video_available=debug_available,
     )
 
 

@@ -65,6 +65,7 @@ export interface JobStatusResponse {
   error: string | null;
   video_meta: VideoMetadata;
   expected_dancer_count: number | null;
+  debug_video_available: boolean;
 }
 
 export interface DancerPosition {

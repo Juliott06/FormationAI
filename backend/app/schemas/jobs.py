@@ -80,6 +80,10 @@ class JobStatusResponse(BaseModel):
     error: str | None = None
     video_meta: VideoMetadata
     expected_dancer_count: int | None = Field(default=None, ge=1)
+    debug_video_available: bool = Field(
+        default=False,
+        description="True when a debug overlay video exists for this job (only the YOLO pipeline produces one)",
+    )
 
 
 class DetectionSummary(BaseModel):
