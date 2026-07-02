@@ -1,0 +1,48 @@
+{
+  "job_id": "example-job",
+  "video": {
+    "filename": "dance_practice.mp4",
+    "fps": 30.0,
+    "frame_count": 5400,
+    "width": 1920,
+    "height": 1080,
+    "duration_sec": 180.0
+  },
+  "coordinate_space": {
+    "image_anchor_px": "pixel anchor point in the source frame",
+    "normalized_stage_proxy": "heuristic top-down proxy derived from image-space anchors"
+  },
+  "summary": {
+    "expected_dancer_count": 9,
+    "unique_track_ids": 2,
+    "max_dancers_in_frame": 2,
+    "average_dancers_per_frame": 2.0,
+    "frames_with_detections": 1,
+    "frames_below_expected": 1,
+    "frames_meeting_expected": 0
+  },
+  "frames": [
+    {
+      "frame": 1240,
+      "timestamp_sec": 41.333,
+      "dancers": [
+        {
+          "id": 1,
+          "bbox": [100, 200, 80, 190],
+          "anchor_px": [140, 390],
+          "x": 0.072917,
+          "y": 0.638889,
+          "confidence": 0.95
+        },
+        {
+          "id": 2,
+          "bbox": [260, 180, 82, 188],
+          "anchor_px": [301, 368],
+          "x": 0.156771,
+          "y": 0.659259,
+          "confidence": 0.93
+        }
+      ]
+    }
+  ]
+}
