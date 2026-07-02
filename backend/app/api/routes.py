@@ -607,11 +607,15 @@ def list_references() -> ReferencesListResponse:
 
 
 def _find_comparison_video(job_dir: Path) -> Path | None:
-    for ext in (".mp4", ".avi"):
-        candidate = job_dir / f"comparison{ext}"
-        if candidate.exists() and candidate.stat().st_size > 0:
-            return candidate
-    return None
+    candidates = [
+        p
+        for ext in (".mp4", ".avi")
+        if (p := job_dir / f"comparison{ext}").exists() and p.stat().st_size > 0
+    ]
+    if not candidates:
+        return None
+    # Newest wins: an older run may have written the other extension.
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 @router.post(
@@ -682,6 +686,13 @@ def compare_to_reference(
         crop = (0, 0, half_w, ref_h)
     else:
         crop = (ref_w - half_w, 0, half_w, ref_h)
+
+    # Remove earlier comparison outputs first: codec fallback may write a
+    # different extension than a previous run, and _find_comparison_video
+    # would then serve the stale file.
+    for ext in (".mp4", ".avi"):
+        stale = job_dir / f"comparison{ext}"
+        stale.unlink(missing_ok=True)
 
     comparison_path = job_dir / "comparison.mp4"
     try:

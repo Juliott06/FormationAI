@@ -68,7 +68,10 @@ class HttpClient(LocateAnythingClient):
 
     def __init__(self, url: str, timeout_sec: float) -> None:
         self._url = url
-        self._timeout = timeout_sec
+        # One persistent connection-pooling client: identify() is called once
+        # per video frame, and a fresh client per call would pay a TCP (+TLS)
+        # handshake thousands of times per clip.
+        self._client = httpx.Client(timeout=timeout_sec)
 
     def identify(self, frame_jpeg, frame_width, frame_height, prompts):
         payload = {
@@ -76,10 +79,9 @@ class HttpClient(LocateAnythingClient):
             "prompts": prompts,
         }
         try:
-            with httpx.Client(timeout=self._timeout) as client:
-                resp = client.post(self._url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            resp = self._client.post(self._url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
         except httpx.HTTPError as exc:
             raise LocateAnythingError(f"LocateAnything HTTP call failed: {exc}") from exc
         except ValueError as exc:

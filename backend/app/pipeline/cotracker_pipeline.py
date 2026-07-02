@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from app.core.config import get_settings
 from app.pipeline.pose import normalize_stage_proxy
 from app.pipeline.processor import finalize_frames, inspect_video_file
 from app.schemas.jobs import (
