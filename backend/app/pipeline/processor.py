@@ -169,27 +169,41 @@ def _dedup_close_dancers_per_formation(
         formation.dancers = kept
 
 
-def _rebuild_positions_result(
-    base: PositionsResult, new_frames: list[FramePositions]
-) -> PositionsResult:
+def finalize_frames(frames: list[FramePositions], *, fps: float) -> "list[Formation]":
+    """Shared post-processing tail: fill detection gaps, refit stage Y, segment
+    into formations, and clean the formations up.
+
+    Every producer of FramePositions — the YOLO pipeline, the SAM2/CoTracker
+    click pipelines, and the merge/swap/label rebuild path — MUST call this
+    single function so all outputs go through identical stages. (These tails
+    were previously copy-pasted per caller and drifted: the YOLO path lost
+    template snapping and the rebuild path lost the stage-Y refit.)"""
     settings = get_settings()
-    _interpolate_missing_dancers(new_frames, settings.interpolation_max_gap_frames)
-    new_formations = _segment_formations(
-        new_frames,
-        fps=base.video.fps,
+    _interpolate_missing_dancers(frames, settings.interpolation_max_gap_frames)
+    _refit_stage_y(frames)
+    formations = _segment_formations(
+        frames,
+        fps=fps,
         movement_threshold_px=settings.formation_movement_threshold_px,
         smoothing_window=settings.formation_smoothing_window,
         min_duration_sec=settings.formation_min_duration_sec,
     )
-    new_formations = _split_by_position_change(
-        new_formations,
-        new_frames,
+    formations = _split_by_position_change(
+        formations,
+        frames,
         window=settings.formation_split_window_frames,
         split_threshold=settings.formation_split_threshold,
     )
-    _snap_formations_to_grid(new_formations, settings.formation_snap_grid_step)
-    _dedup_close_dancers_per_formation(new_formations, settings.formation_dedup_distance)
-    _snap_formations_to_templates(new_formations, settings.formation_template_snap_threshold)
+    _snap_formations_to_grid(formations, settings.formation_snap_grid_step)
+    _dedup_close_dancers_per_formation(formations, settings.formation_dedup_distance)
+    _snap_formations_to_templates(formations, settings.formation_template_snap_threshold)
+    return formations
+
+
+def _rebuild_positions_result(
+    base: PositionsResult, new_frames: list[FramePositions]
+) -> PositionsResult:
+    new_formations = finalize_frames(new_frames, fps=base.video.fps)
 
     unique_ids = {d.id for f in new_frames for d in f.dancers}
     counts = [len(f.dancers) for f in new_frames]
@@ -997,23 +1011,7 @@ def process_video(
         proximity=settings.gradual_swap_proximity,
         advantage=settings.gradual_swap_advantage,
     )
-    _interpolate_missing_dancers(frames, settings.interpolation_max_gap_frames)
-    _refit_stage_y(frames)
-    formations = _segment_formations(
-        frames,
-        fps=video_meta.fps,
-        movement_threshold_px=settings.formation_movement_threshold_px,
-        smoothing_window=settings.formation_smoothing_window,
-        min_duration_sec=settings.formation_min_duration_sec,
-    )
-    formations = _split_by_position_change(
-        formations,
-        frames,
-        window=settings.formation_split_window_frames,
-        split_threshold=settings.formation_split_threshold,
-    )
-    _snap_formations_to_grid(formations, settings.formation_snap_grid_step)
-    _dedup_close_dancers_per_formation(formations, settings.formation_dedup_distance)
+    formations = finalize_frames(frames, fps=video_meta.fps)
 
     total_frames = len(frames)
     return PositionsResult(

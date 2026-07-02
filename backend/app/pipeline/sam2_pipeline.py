@@ -7,16 +7,7 @@ from typing import Callable
 
 from app.core.config import get_settings
 from app.pipeline.pose import normalize_stage_proxy
-from app.pipeline.processor import (
-    _dedup_close_dancers_per_formation,
-    _interpolate_missing_dancers,
-    _refit_stage_y,
-    _segment_formations,
-    _snap_formations_to_grid,
-    _snap_formations_to_templates,
-    _split_by_position_change,
-    inspect_video_file,
-)
+from app.pipeline.processor import finalize_frames, inspect_video_file
 from app.schemas.jobs import (
     CoordinateSpaceMetadata,
     DancerClick,
@@ -146,24 +137,7 @@ def process_video_with_sam2(
 
     progress_callback(video_meta.frame_count, max(video_meta.frame_count, 1))
 
-    _interpolate_missing_dancers(frames, settings.interpolation_max_gap_frames)
-    _refit_stage_y(frames)
-    formations = _segment_formations(
-        frames,
-        fps=video_meta.fps,
-        movement_threshold_px=settings.formation_movement_threshold_px,
-        smoothing_window=settings.formation_smoothing_window,
-        min_duration_sec=settings.formation_min_duration_sec,
-    )
-    formations = _split_by_position_change(
-        formations,
-        frames,
-        window=settings.formation_split_window_frames,
-        split_threshold=settings.formation_split_threshold,
-    )
-    _snap_formations_to_grid(formations, settings.formation_snap_grid_step)
-    _dedup_close_dancers_per_formation(formations, settings.formation_dedup_distance)
-    _snap_formations_to_templates(formations, settings.formation_template_snap_threshold)
+    formations = finalize_frames(frames, fps=video_meta.fps)
 
     frames_below_expected = sum(1 for f in frames if len(f.dancers) < expected)
     frames_meeting_expected = sum(1 for f in frames if len(f.dancers) >= expected)

@@ -143,9 +143,16 @@ def concat_side_by_side(
     left_crop: tuple[int, int, int, int] | None = None,
     right_crop: tuple[int, int, int, int] | None = None,
 ) -> Path:
-    """Read two videos frame by frame, scale to a common height, concat horizontally.
+    """Compose two videos side by side, synchronized by TIMESTAMP.
+
+    The sources may have different fps (e.g. a 30.6fps reference next to a
+    24fps rendered stage view). Output runs at the faster fps; at each output
+    time t, each side shows its frame whose timestamp covers t (slower side's
+    frames are held/duplicated). Naive 1:1 frame pairing would desync the
+    panels by (fast/slow - 1) per unit time.
 
     left_crop/right_crop: optional (x, y, w, h) crop applied to each source.
+    Ends when EITHER side runs out of frames.
     Returns the actual output path (codec-fallback may swap extension)."""
     import cv2
     import numpy as np
@@ -158,11 +165,9 @@ def concat_side_by_side(
         left_cap.release()
         raise FileNotFoundError(f"Unable to open right video: {right_video}")
 
-    fps = max(
-        left_cap.get(cv2.CAP_PROP_FPS) or 0.0,
-        right_cap.get(cv2.CAP_PROP_FPS) or 0.0,
-        1.0,
-    )
+    left_fps = left_cap.get(cv2.CAP_PROP_FPS) or 0.0
+    right_fps = right_cap.get(cv2.CAP_PROP_FPS) or 0.0
+    out_fps = max(left_fps, right_fps, 1.0)
 
     def _read(cap, crop):
         ok, frame = cap.read()
@@ -173,23 +178,51 @@ def concat_side_by_side(
             frame = frame[y : y + h, x : x + w]
         return frame
 
-    first_left = _read(left_cap, left_crop)
-    first_right = _read(right_cap, right_crop)
-    if first_left is None or first_right is None:
+    class _TimedSide:
+        """Holds the current frame of one source and advances it by timestamp."""
+
+        def __init__(self, cap, crop, fps):
+            self.cap = cap
+            self.crop = crop
+            self.fps = max(fps, 1.0)
+            self.frames_read = 0
+            self.current = None
+            self.exhausted = False
+            self._advance_one()
+
+        def _advance_one(self):
+            frame = _read(self.cap, self.crop)
+            if frame is None:
+                self.exhausted = True
+                return
+            self.current = frame
+            self.frames_read += 1
+
+        def frame_at(self, t: float):
+            """Frame covering output time t, advancing as needed."""
+            # frames_read frames cover [0, frames_read/fps); advance while the
+            # NEXT frame's start time is still <= t.
+            while not self.exhausted and self.frames_read / self.fps <= t:
+                self._advance_one()
+            return None if self.exhausted else self.current
+
+    left = _TimedSide(left_cap, left_crop, left_fps)
+    right = _TimedSide(right_cap, right_crop, right_fps)
+    if left.current is None or right.current is None:
         left_cap.release()
         right_cap.release()
         raise ValueError("One of the videos has no readable frames")
 
-    target_h = max(first_left.shape[0], first_right.shape[0])
+    target_h = max(left.current.shape[0], right.current.shape[0])
 
     def _resize_to_height(img, h):
         ratio = h / max(img.shape[0], 1)
         new_w = max(int(round(img.shape[1] * ratio)), 1)
         return cv2.resize(img, (new_w, h))
 
-    first_left_r = _resize_to_height(first_left, target_h)
-    first_right_r = _resize_to_height(first_right, target_h)
-    out_w = first_left_r.shape[1] + first_right_r.shape[1]
+    left_w = _resize_to_height(left.current, target_h).shape[1]
+    right_w = _resize_to_height(right.current, target_h).shape[1]
+    out_w = left_w + right_w
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer: Any = None
@@ -198,13 +231,14 @@ def concat_side_by_side(
         candidate = output_path.with_suffix(ext)
         fourcc = cv2.VideoWriter_fourcc(*codec)
         candidate_writer = cv2.VideoWriter(
-            str(candidate), fourcc, fps, (out_w, target_h)
+            str(candidate), fourcc, out_fps, (out_w, target_h)
         )
         if candidate_writer.isOpened():
             writer = candidate_writer
             chosen_path = candidate
             logger.info(
-                "comparison video writer ready: %s (codec=%s)", candidate.name, codec
+                "comparison video writer ready: %s (codec=%s, %.2f fps, L=%.2f R=%.2f)",
+                candidate.name, codec, out_fps, left_fps, right_fps,
             )
             break
 
@@ -214,22 +248,21 @@ def concat_side_by_side(
         raise ValueError("No working codec for comparison video")
 
     try:
-        combined = np.hstack([first_left_r, first_right_r])
-        writer.write(combined)
+        out_index = 0
         while True:
-            l = _read(left_cap, left_crop)
-            r = _read(right_cap, right_crop)
+            t = out_index / out_fps
+            l = left.frame_at(t)
+            r = right.frame_at(t)
             if l is None or r is None:
                 break
             l = _resize_to_height(l, target_h)
             r = _resize_to_height(r, target_h)
-            if l.shape[1] + r.shape[1] != out_w:
-                # Pad/truncate to keep output width stable
-                r_target = out_w - l.shape[1]
-                if r_target <= 0:
-                    continue
-                r = cv2.resize(r, (r_target, target_h))
+            if l.shape[1] != left_w:
+                l = cv2.resize(l, (left_w, target_h))
+            if r.shape[1] != right_w:
+                r = cv2.resize(r, (right_w, target_h))
             writer.write(np.hstack([l, r]))
+            out_index += 1
     finally:
         writer.release()
         left_cap.release()
