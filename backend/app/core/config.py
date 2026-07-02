@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     api_prefix: str = "/api/v1"
     jobs_dir: Path = Field(default=DEFAULT_DATA_DIR / "jobs")
+    references_dir: Path = Field(default=DEFAULT_DATA_DIR / "references")
     pose_model_path: Path = Field(default=DEFAULT_POSE_MODEL)
     yolo_model_name: str = "yolo26s.pt"
     yolo_confidence_threshold: float = 0.15
@@ -66,4 +67,5 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     settings = Settings()
     settings.jobs_dir.mkdir(parents=True, exist_ok=True)
+    settings.references_dir.mkdir(parents=True, exist_ok=True)
     return settings

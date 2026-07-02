@@ -32,6 +32,19 @@ class DancerClick(BaseModel):
     y: int = Field(ge=0, description="Y pixel coordinate in the key frame")
 
 
+def unique_click_names(clicks: list[DancerClick]) -> list[str]:
+    """Unique dancer names in first-occurrence order.
+
+    Duplicate names are multiple tracking points on one dancer; the position of
+    a name in this list defines its track_id (index + 1) everywhere — pipelines,
+    saved labels, and summary stats must all derive from this one ordering."""
+    seen: list[str] = []
+    for click in clicks:
+        if click.name not in seen:
+            seen.append(click.name)
+    return seen
+
+
 class ClickSeedRequest(BaseModel):
     key_frame: int = Field(ge=0, description="Frame index the clicks were made on")
     clicks: list[DancerClick] = Field(min_length=1)

@@ -127,3 +127,16 @@ def test_confidence_clamped_to_unit_interval():
     frames = tracks_to_frames(tracks, clicks, meta)
     assert frames[0].dancers[0].confidence == 1.0
     assert frames[1].dancers[0].confidence == 0.0
+
+
+def test_unique_click_names_first_occurrence_order():
+    from app.schemas.jobs import unique_click_names
+
+    clicks = [
+        _click("Yeji"),
+        _click("Yeji"),   # multi-click duplicate
+        _click("Lia"),
+        _click("Yeji"),   # another duplicate, later
+        _click("Ryujin"),
+    ]
+    assert unique_click_names(clicks) == ["Yeji", "Lia", "Ryujin"]

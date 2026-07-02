@@ -24,6 +24,7 @@ from app.schemas.jobs import (
     DetectionSummary,
     FramePositions,
     PositionsResult,
+    unique_click_names,
 )
 from app.services.sam2 import FrameBox, Sam2Error, build_client as build_sam2_client
 from app.schemas.jobs import VideoMetadata
@@ -44,14 +45,12 @@ def tracks_to_frames(
     Multi-click semantics: SAM2 cannot use multiple click points per name on
     the server side, so we collapse duplicate names to the first occurrence
     here. (CoTracker is the path that actually supports multi-click.)"""
-    unique_clicks: list[DancerClick] = []
-    seen_names: set[str] = set()
+    names = unique_click_names(clicks)
+    first_click_by_name = {}
     for click in clicks:
-        if click.name in seen_names:
-            continue
-        seen_names.add(click.name)
-        unique_clicks.append(click)
-    name_to_id: dict[str, int] = {c.name: idx + 1 for idx, c in enumerate(unique_clicks)}
+        first_click_by_name.setdefault(click.name, click)
+    unique_clicks: list[DancerClick] = [first_click_by_name[n] for n in names]
+    name_to_id: dict[str, int] = {n: idx + 1 for idx, n in enumerate(names)}
     by_name_frame: dict[str, dict[int, FrameBox]] = {
         name: {fb.frame: fb for fb in fblist} for name, fblist in tracks.items()
     }
@@ -115,6 +114,8 @@ def process_video_with_sam2(
         seen_payload_names.add(c.name)
         click_payload.append({"name": c.name, "key_frame": key_frame, "x": c.x, "y": c.y})
 
+    expected = len(unique_click_names(clicks))
+
     sam2_client = build_sam2_client()
     logger.info(
         "SAM2 pipeline: job=%s frames=%d clicks=%d key_frame=%d url=%s",
@@ -164,7 +165,6 @@ def process_video_with_sam2(
     _dedup_close_dancers_per_formation(formations, settings.formation_dedup_distance)
     _snap_formations_to_templates(formations, settings.formation_template_snap_threshold)
 
-    expected = len(clicks)
     frames_below_expected = sum(1 for f in frames if len(f.dancers) < expected)
     frames_meeting_expected = sum(1 for f in frames if len(f.dancers) >= expected)
 
@@ -182,7 +182,7 @@ def process_video_with_sam2(
         ),
         summary=DetectionSummary(
             expected_dancer_count=expected,
-            unique_track_ids=len(clicks),
+            unique_track_ids=expected,
             max_dancers_in_frame=max_dancers_in_frame,
             average_dancers_per_frame=round(
                 dancers_per_frame_total / max(total_frames, 1), 3

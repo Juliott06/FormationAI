@@ -132,13 +132,13 @@ def main() -> int:
         logger.info("pipeline done in %.1fs", elapsed)
 
         store.save_positions(job_id, positions)
-        # Dedupe by unique-name first-occurrence so labels line up with the
-        # track_ids the pipeline assigns (multi-click collapses to one id).
-        unique_click_names: list[str] = []
-        for c in clicks:
-            if c.name not in unique_click_names:
-                unique_click_names.append(c.name)
-        click_labels = {idx + 1: name for idx, name in enumerate(unique_click_names)}
+        # Labels follow unique-name first-occurrence order, matching pipeline
+        # track_ids (multi-click duplicates collapse to one id).
+        from app.schemas.jobs import unique_click_names
+
+        click_labels = {
+            idx + 1: name for idx, name in enumerate(unique_click_names(clicks))
+        }
         store.save_labels(job_id, click_labels)
         store.update_job(
             job_id, status="completed",

@@ -100,13 +100,13 @@ class LocalClient(CoTrackerClient):
         logger.info("CoTracker3 ready (online, step=%d)", model.step)
         return cls._model
 
-    def track_video(self, video_path, clicks):
+    def track_video(self, video_path, clicks) -> list[list[TrackedPoint]]:
         import cv2
         import numpy as np
         import torch
 
         if not clicks:
-            return {}
+            return []
 
         model = self._ensure_model()
         step = int(model.step)
@@ -139,23 +139,35 @@ class LocalClient(CoTrackerClient):
             queries.append([float(kf), qx, qy])
         queries_tensor = torch.tensor(queries, dtype=torch.float32).unsqueeze(0)
 
-        # Stream all frames into memory as a single tensor. Online mode still
-        # processes incrementally but the public API expects the full tensor;
-        # at 960x540 RGB this is ~1.5 MB/frame so a 5000-frame clip is ~7.5 GB
-        # — too much. We use a chunked feed via video_chunk argument instead.
-        all_tracks: list[Any] = []
-        all_vis: list[Any] = []
-
-        # Read all frames first as a list of numpy arrays (~1.5 MB each).
-        # For Gabriela 4919 frames at 960x540 → ~7.5 GB. We must instead
-        # build a generator that yields chunks. CoTracker online API needs
-        # video_chunk of shape [B, T_chunk, C, H, W] where T_chunk >= step*2.
+        # Frames stream from disk in sliding windows of step*2, advancing by
+        # `step`, so memory stays bounded regardless of clip length. Each model
+        # call returns CUMULATIVE tracks for all frames so far — we keep only
+        # the most recent result.
         chunk_size = step * 2
         chunk_buffer: list[np.ndarray] = []
         frames_read = 0
         last_logged = 0
+        final_tracks: Any = None
+        final_vis: Any = None
         import time as _time
         t0 = _time.perf_counter()
+
+        def _run_window(buffer: list[np.ndarray]) -> None:
+            nonlocal initialized, final_tracks, final_vis
+            arr = np.stack(buffer)  # T, H, W, C
+            chunk_tensor = (
+                torch.from_numpy(arr).permute(0, 3, 1, 2).float().unsqueeze(0)
+            )
+            if not initialized:
+                model(
+                    video_chunk=chunk_tensor,
+                    is_first_step=True,
+                    queries=queries_tensor,
+                )
+                initialized = True
+            tracks, vis = model(video_chunk=chunk_tensor)
+            final_tracks = tracks.detach().cpu()
+            final_vis = vis.detach().cpu()
 
         with torch.no_grad():
             initialized = False
@@ -168,22 +180,8 @@ class LocalClient(CoTrackerClient):
                 chunk_buffer.append(frame_rgb)
                 frames_read += 1
 
-                # When we have a full window, run a step
                 if len(chunk_buffer) >= chunk_size:
-                    arr = np.stack(chunk_buffer[:chunk_size])  # T, H, W, C
-                    chunk_tensor = (
-                        torch.from_numpy(arr).permute(0, 3, 1, 2).float().unsqueeze(0)
-                    )
-                    if not initialized:
-                        model(
-                            video_chunk=chunk_tensor,
-                            is_first_step=True,
-                            queries=queries_tensor,
-                        )
-                        initialized = True
-                    tracks, vis = model(video_chunk=chunk_tensor)
-                    all_tracks.append(tracks.detach().cpu())
-                    all_vis.append(vis.detach().cpu())
+                    _run_window(chunk_buffer[:chunk_size])
                     # advance by `step` (sliding window), keep last `step` for context
                     chunk_buffer = chunk_buffer[step:]
 
@@ -196,32 +194,25 @@ class LocalClient(CoTrackerClient):
                         )
                         last_logged = frames_read
 
-            # Final partial chunk: pad to window size and run
-            if chunk_buffer and initialized:
+            # Final partial window: pad with copies of the last frame. Also
+            # handles clips shorter than one full window (< step*2 frames),
+            # which otherwise would never initialize the model.
+            if chunk_buffer:
                 pad_needed = chunk_size - len(chunk_buffer)
                 if pad_needed > 0:
                     last = chunk_buffer[-1]
                     chunk_buffer = chunk_buffer + [last] * pad_needed
-                arr = np.stack(chunk_buffer)
-                chunk_tensor = (
-                    torch.from_numpy(arr).permute(0, 3, 1, 2).float().unsqueeze(0)
-                )
-                tracks, vis = model(video_chunk=chunk_tensor)
-                all_tracks.append(tracks.detach().cpu())
-                all_vis.append(vis.detach().cpu())
+                _run_window(chunk_buffer)
 
         cap.release()
 
-        if not all_tracks:
-            raise CoTrackerError("CoTracker produced no output")
+        if final_tracks is None:
+            raise CoTrackerError("CoTracker produced no output (no readable frames)")
 
-        # CoTracker online returns CUMULATIVE tracks per call (the last call
-        # contains the full history). Take the LAST result and truncate to
-        # the actual frame count (we may have padded the last chunk).
-        final_tracks = all_tracks[-1]
-        final_vis = all_vis[-1]
+        # Truncate to frames actually decoded — metadata frame counts over-report
+        # on some containers, and the final window may be padded.
         T = final_tracks.shape[1]
-        actual_T = min(T, n_frames)
+        actual_T = min(T, frames_read)
         final_tracks = final_tracks[:, :actual_T]
         final_vis = final_vis[:, :actual_T]
 

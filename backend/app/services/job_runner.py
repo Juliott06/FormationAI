@@ -4,6 +4,7 @@ from app.core.config import get_settings
 from app.pipeline.cotracker_pipeline import process_video_with_cotracker
 from app.pipeline.processor import process_video
 from app.pipeline.sam2_pipeline import process_video_with_sam2
+from app.schemas.jobs import unique_click_names
 from app.services.storage import JobStore
 
 
@@ -22,14 +23,12 @@ def run_processing_job(job_id: str) -> None:
     histograms_out: dict[int, list[float]] = {}
 
     try:
-        # Build labels by unique-name first-occurrence order, matching how the
+        # Labels follow unique-name first-occurrence order, matching how the
         # cotracker/sam2 pipelines assign track_ids. Multi-click on one dancer
         # produces duplicate names; they collapse to a single track_id.
-        unique_click_names: list[str] = []
-        for c in job.clicks:
-            if c.name not in unique_click_names:
-                unique_click_names.append(c.name)
-        click_labels = {idx + 1: name for idx, name in enumerate(unique_click_names)}
+        click_labels = {
+            idx + 1: name for idx, name in enumerate(unique_click_names(job.clicks))
+        }
 
         if sam2_enabled:
             positions = process_video_with_sam2(

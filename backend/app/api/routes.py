@@ -30,13 +30,11 @@ from app.services.job_runner import run_processing_job
 from app.services.storage import JobNotFoundError, JobStore
 
 
-_REFERENCES_DIR = Path(__file__).resolve().parents[3] / "data" / "references"
 _REFERENCE_EXTS = {".mp4", ".mov", ".m4v", ".avi"}
 
 
 def _references_dir() -> Path:
-    _REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
-    return _REFERENCES_DIR
+    return get_settings().references_dir
 
 
 def _safe_reference_path(filename: str) -> Path:

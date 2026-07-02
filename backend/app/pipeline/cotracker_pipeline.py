@@ -38,6 +38,7 @@ from app.schemas.jobs import (
     FramePositions,
     PositionsResult,
     VideoMetadata,
+    unique_click_names,
 )
 from app.services.cotracker import TrackedPoint, build_client
 
@@ -69,13 +70,9 @@ def tracked_points_to_frames(
     point's y is mapped to where the foot would be.
 
     Pure function — easy to unit test."""
-    # Maintain roster order: first occurrence of each name is its track_id
-    unique_names: list[str] = []
-    name_to_id: dict[str, int] = {}
-    for click in clicks:
-        if click.name not in name_to_id:
-            unique_names.append(click.name)
-            name_to_id[click.name] = len(unique_names)
+    # Roster order: first occurrence of each name is its track_id
+    unique_names = unique_click_names(clicks)
+    name_to_id: dict[str, int] = {n: idx + 1 for idx, n in enumerate(unique_names)}
     # Map name → indices into the parallel tracks/clicks lists
     name_to_indices: dict[str, list[int]] = {n: [] for n in unique_names}
     for idx, click in enumerate(clicks):
@@ -199,8 +196,7 @@ def process_video_with_cotracker(
     _dedup_close_dancers_per_formation(formations, settings.formation_dedup_distance)
     _snap_formations_to_templates(formations, settings.formation_template_snap_threshold)
 
-    unique_names = list(dict.fromkeys(c.name for c in clicks))
-    expected = len(unique_names)
+    expected = len(unique_click_names(clicks))
     frames_below_expected = sum(1 for f in frames if len(f.dancers) < expected)
     frames_meeting_expected = sum(1 for f in frames if len(f.dancers) >= expected)
 
