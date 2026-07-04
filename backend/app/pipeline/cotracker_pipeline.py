@@ -20,7 +20,7 @@ from typing import Callable
 
 from app.pipeline.homography import compute_stage_homography, project_to_stage
 from app.pipeline.pose import normalize_stage_proxy
-from app.pipeline.processor import finalize_frames, inspect_video_file
+from app.pipeline.processor import apply_stage_rescue, finalize_frames, inspect_video_file
 from app.schemas.jobs import (
     CoordinateSpaceMetadata,
     DancerClick,
@@ -177,6 +177,8 @@ def process_video_with_cotracker(
     )
 
     frames = tracked_points_to_frames(tracks, clicks, video_meta, homography)
+    if homography is not None:
+        apply_stage_rescue(frames)
 
     dancers_per_frame_total = sum(len(f.dancers) for f in frames)
     max_dancers_in_frame = max((len(f.dancers) for f in frames), default=0)
@@ -185,7 +187,12 @@ def process_video_with_cotracker(
     progress_callback(video_meta.frame_count, max(video_meta.frame_count, 1))
 
     calibrated = homography is not None
-    formations = finalize_frames(frames, fps=video_meta.fps, refit_y=not calibrated)
+    formations = finalize_frames(
+        frames,
+        fps=video_meta.fps,
+        refit_y=not calibrated,
+        frame_height=video_meta.height,
+    )
 
     expected = len(unique_click_names(clicks))
     frames_below_expected = sum(1 for f in frames if len(f.dancers) < expected)

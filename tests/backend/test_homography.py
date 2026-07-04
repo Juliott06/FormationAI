@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.pipeline.homography import (
     STAGE_MARGIN,
+    compute_rescue_affine,
     compute_stage_homography,
     project_to_stage,
 )
@@ -94,3 +95,42 @@ def test_project_handles_point_at_infinity_gracefully():
     # rather than exploding.
     h = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
     assert project_to_stage(h, (0, 0)) == (0.5, 0.5)
+
+
+def test_rescue_identity_when_points_on_canvas():
+    # A well-marked floor: all points inside [0,1] — leave untouched.
+    points = [(0.2, 0.3), (0.8, 0.85), (0.5, 0.05)]
+    assert compute_rescue_affine(points) == (1.0, 0.0, 0.0)
+
+
+def test_rescue_pulls_far_outside_points_onto_canvas():
+    # The observed real-world failure: user marked only the floor IN FRONT of
+    # the dancers, so every projected position landed far beyond the back edge
+    # (v around 1.5-4.0). Rescue must bring them all inside with room to move.
+    points = [(0.1, 1.8), (0.9, 3.9), (0.5, 2.5)]
+    s, ox, oy = compute_rescue_affine(points)
+    assert s < 1.0
+    lo, hi = STAGE_MARGIN, 1.0 - STAGE_MARGIN
+    for x, y in points:
+        nx, ny = s * x + ox, s * y + oy
+        assert lo - 1e-9 <= nx <= hi + 1e-9
+        assert lo - 1e-9 <= ny <= hi + 1e-9
+
+
+def test_rescue_scale_is_uniform_preserving_proportions():
+    # Two dancers 0.4 apart in x, 0.2 apart in y (outside canvas in y).
+    a = (0.3, 1.5)
+    b = (0.7, 1.7)
+    s, ox, oy = compute_rescue_affine([a, b])
+    ax, ay = s * a[0] + ox, s * a[1] + oy
+    bx, by = s * b[0] + ox, s * b[1] + oy
+    # x-distance : y-distance ratio must survive the rescue exactly (2:1)
+    assert abs((bx - ax) / (by - ay) - 2.0) < 1e-9
+
+
+def test_rescue_handles_all_points_identical():
+    # Everyone clamped to one spot must not divide by zero; lands on-canvas.
+    s, ox, oy = compute_rescue_affine([(0.5, 4.0), (0.5, 4.0)])
+    nx, ny = s * 0.5 + ox, s * 4.0 + oy
+    assert 0.0 <= nx <= 1.0
+    assert 0.0 <= ny <= 1.0

@@ -169,8 +169,44 @@ def _dedup_close_dancers_per_formation(
         formation.dancers = kept
 
 
+def apply_stage_rescue(frames: list[FramePositions]) -> None:
+    """Fix calibrated stage coords that fell outside the canvas.
+
+    project_to_stage is unclamped, so a badly marked floor quad (e.g. one that
+    doesn't contain the ground under the dancers) yields coords outside [0,1].
+    This computes one uniform-scale affine over ALL positions in the clip and
+    applies it, then clamps — dancers stay in true proportion instead of piling
+    up on a canvas edge. No-op when the quad was marked well."""
+    from app.pipeline.homography import compute_rescue_affine
+
+    points = [(d.x, d.y) for f in frames for d in f.dancers]
+    if not points:
+        return
+    s, ox, oy = compute_rescue_affine(points)
+    if s == 1.0 and ox == 0.0 and oy == 0.0:
+        # Still clamp: individual outliers within an otherwise-inside set.
+        for f in frames:
+            for d in f.dancers:
+                d.x = round(min(max(d.x, 0.0), 1.0), 6)
+                d.y = round(min(max(d.y, 0.0), 1.0), 6)
+        return
+    logger.info(
+        "stage rescue applied: scale=%.3f offset=(%.3f, %.3f) — the marked floor "
+        "quad did not contain all dancer positions",
+        s, ox, oy,
+    )
+    for f in frames:
+        for d in f.dancers:
+            d.x = round(min(max(s * d.x + ox, 0.0), 1.0), 6)
+            d.y = round(min(max(s * d.y + oy, 0.0), 1.0), 6)
+
+
 def finalize_frames(
-    frames: list[FramePositions], *, fps: float, refit_y: bool = True
+    frames: list[FramePositions],
+    *,
+    fps: float,
+    refit_y: bool = True,
+    frame_height: int = 1080,
 ) -> "list[Formation]":
     """Shared post-processing tail: fill detection gaps, refit stage Y, segment
     into formations, and clean the formations up.
@@ -183,7 +219,10 @@ def finalize_frames(
 
     refit_y: the vertical-stretch heuristic that compensates for camera
     perspective. Pass False when x,y are already true top-down floor coords
-    (a stage homography was applied) — refitting would re-distort them."""
+    (a stage homography was applied) — refitting would re-distort them.
+
+    frame_height: source video height, used to normalize movement so the
+    formation threshold means the same thing at every resolution/fps."""
     settings = get_settings()
     _interpolate_missing_dancers(frames, settings.interpolation_max_gap_frames)
     if refit_y:
@@ -194,6 +233,7 @@ def finalize_frames(
         movement_threshold_px=settings.formation_movement_threshold_px,
         smoothing_window=settings.formation_smoothing_window,
         min_duration_sec=settings.formation_min_duration_sec,
+        frame_height=frame_height,
     )
     formations = _split_by_position_change(
         formations,
@@ -213,7 +253,10 @@ def _rebuild_positions_result(
     # If the job was calibrated, x,y are already true top-down coords — don't
     # re-apply the perspective-compensation stretch.
     new_formations = finalize_frames(
-        new_frames, fps=base.video.fps, refit_y=not base.stage_calibrated
+        new_frames,
+        fps=base.video.fps,
+        refit_y=not base.stage_calibrated,
+        frame_height=base.video.height,
     )
 
     unique_ids = {d.id for f in new_frames for d in f.dancers}
@@ -382,6 +425,16 @@ def _split_by_position_change(
     return result
 
 
+# Movement thresholds are expressed in px/frame at this reference format.
+# Measured movement is normalized to it so the same physical motion reads the
+# same number whether the upload is 720p@30fps or 1080p@24fps — otherwise the
+# threshold silently tightens on smaller/faster-fps videos (a 720p/30fps clip
+# produced ~54% of the px/frame of the 1080p/24fps clip the threshold was
+# tuned on, merging a whole song into one formation).
+_MOVEMENT_REF_HEIGHT = 1080.0
+_MOVEMENT_REF_FPS = 24.0
+
+
 def _segment_formations(
     frames: list[FramePositions],
     fps: float,
@@ -389,10 +442,14 @@ def _segment_formations(
     movement_threshold_px: float,
     smoothing_window: int,
     min_duration_sec: float,
+    frame_height: int = 1080,
 ) -> list[Formation]:
     if len(frames) < 2:
         return []
 
+    norm = (_MOVEMENT_REF_HEIGHT / max(frame_height, 1)) * (
+        max(fps, 1.0) / _MOVEMENT_REF_FPS
+    )
     raw_movement: list[float] = [0.0]
     for i in range(1, len(frames)):
         prev_by_id = {d.id: d.anchor_px for d in frames[i - 1].dancers}
@@ -401,7 +458,7 @@ def _segment_formations(
             if d.id in prev_by_id:
                 dx = d.anchor_px[0] - prev_by_id[d.id][0]
                 dy = d.anchor_px[1] - prev_by_id[d.id][1]
-                raw_dist = (dx * dx + dy * dy) ** 0.5
+                raw_dist = (dx * dx + dy * dy) ** 0.5 * norm
                 distances.append(min(raw_dist, _MAX_REASONABLE_DISPLACEMENT_PX))
         raw_movement.append(sum(distances) / len(distances) if distances else float("inf"))
 
@@ -1023,7 +1080,9 @@ def process_video(
         proximity=settings.gradual_swap_proximity,
         advantage=settings.gradual_swap_advantage,
     )
-    formations = finalize_frames(frames, fps=video_meta.fps)
+    formations = finalize_frames(
+        frames, fps=video_meta.fps, frame_height=video_meta.height
+    )
 
     total_frames = len(frames)
     return PositionsResult(

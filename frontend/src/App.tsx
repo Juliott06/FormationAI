@@ -853,6 +853,19 @@ function Metric({
 
 type PickMode = 'corners' | 'dancers';
 
+function pointInQuad(px: number, py: number, quad: [number, number][]): boolean {
+  // Standard ray-cast: count edge crossings of a horizontal ray from (px,py).
+  let inside = false;
+  for (let i = 0, j = quad.length - 1; i < quad.length; j = i++) {
+    const [xi, yi] = quad[i];
+    const [xj, yj] = quad[j];
+    if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
 function ClickPicker({
   jobId,
   videoMeta,
@@ -974,10 +987,12 @@ function ClickPicker({
         <div className="click-picker-header">
           <strong>Step 1 — Mark the dance floor ({stageCorners.length}/4 corners)</strong>
           <span>
-            Click the <strong>4 corners of the floor</strong> (back-left, back-right,
-            front-right, front-left). This lets us show a true top-down view instead of
-            the angled camera view, so formations aren't distorted. Click order doesn't
-            matter — we sort them automatically.
+            Click 4 corners outlining the ground the dancers stand on. The rectangle
+            must <strong>include the floor under every dancer</strong> — put the two
+            back corners where the <strong>wall meets the floor behind them</strong>{' '}
+            (not in front of their feet), and the two front corners at the bottom of
+            the frame. Click order doesn't matter — we sort automatically. This turns
+            the angled camera view into a true top-down view.
           </span>
         </div>
       ) : (
@@ -1002,6 +1017,16 @@ function ClickPicker({
               )}
             </span>
           )}
+          {stageCorners.length === 4 &&
+            clicks.some((c) => !pointInQuad(c.x, c.y, stageCorners)) && (
+              <span className="seed-frame-note">
+                <strong>
+                  ⚠ Some dancers are outside your marked floor — the view will be
+                  auto-adjusted, but for best results redo the corners so the floor
+                  includes the ground under every dancer.
+                </strong>
+              </span>
+            )}
         </div>
       )}
 
