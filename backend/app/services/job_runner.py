@@ -36,6 +36,7 @@ def run_processing_job(job_id: str) -> None:
                 video_path=video_path,
                 clicks=job.clicks,
                 key_frame=job.key_frame,
+                stage_corners=job.stage_corners,
                 progress_callback=lambda processed, total: store.update_job(
                     job_id,
                     status="processing",
@@ -51,6 +52,7 @@ def run_processing_job(job_id: str) -> None:
                 video_path=video_path,
                 clicks=job.clicks,
                 key_frame=job.key_frame,
+                stage_corners=job.stage_corners,
                 progress_callback=lambda processed, total: store.update_job(
                     job_id,
                     status="processing",

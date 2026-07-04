@@ -306,11 +306,28 @@ def submit_clicks(
             ),
         )
 
+    # Stage corners are optional; when present, must be exactly 4 in-bounds points.
+    stage_corners: list[list[int]] = []
+    if request.stage_corners:
+        if len(request.stage_corners) != 4:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="stage_corners must be exactly 4 [x,y] points when provided",
+            )
+        for pt in request.stage_corners:
+            if len(pt) != 2 or not (0 <= pt[0] < fw and 0 <= pt[1] < fh):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"stage corner {pt} out of frame bounds ({fw}x{fh})",
+                )
+        stage_corners = [[int(pt[0]), int(pt[1])] for pt in request.stage_corners]
+
     updated = store.update_job(
         job_id,
         status="queued",
         clicks=[c.model_dump(mode="json") for c in request.clicks],
         key_frame=request.key_frame,
+        stage_corners=stage_corners,
         error=None,
     )
     background_tasks.add_task(run_processing_job, job_id)
@@ -326,6 +343,7 @@ def submit_clicks(
         error=updated.error,
         video_meta=updated.video_meta,
         expected_dancer_count=updated.expected_dancer_count,
+        debug_video_available=False,
     )
 
 

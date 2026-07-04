@@ -169,7 +169,9 @@ def _dedup_close_dancers_per_formation(
         formation.dancers = kept
 
 
-def finalize_frames(frames: list[FramePositions], *, fps: float) -> "list[Formation]":
+def finalize_frames(
+    frames: list[FramePositions], *, fps: float, refit_y: bool = True
+) -> "list[Formation]":
     """Shared post-processing tail: fill detection gaps, refit stage Y, segment
     into formations, and clean the formations up.
 
@@ -177,10 +179,15 @@ def finalize_frames(frames: list[FramePositions], *, fps: float) -> "list[Format
     click pipelines, and the merge/swap/label rebuild path — MUST call this
     single function so all outputs go through identical stages. (These tails
     were previously copy-pasted per caller and drifted: the YOLO path lost
-    template snapping and the rebuild path lost the stage-Y refit.)"""
+    template snapping and the rebuild path lost the stage-Y refit.)
+
+    refit_y: the vertical-stretch heuristic that compensates for camera
+    perspective. Pass False when x,y are already true top-down floor coords
+    (a stage homography was applied) — refitting would re-distort them."""
     settings = get_settings()
     _interpolate_missing_dancers(frames, settings.interpolation_max_gap_frames)
-    _refit_stage_y(frames)
+    if refit_y:
+        _refit_stage_y(frames)
     formations = _segment_formations(
         frames,
         fps=fps,
@@ -203,7 +210,11 @@ def finalize_frames(frames: list[FramePositions], *, fps: float) -> "list[Format
 def _rebuild_positions_result(
     base: PositionsResult, new_frames: list[FramePositions]
 ) -> PositionsResult:
-    new_formations = finalize_frames(new_frames, fps=base.video.fps)
+    # If the job was calibrated, x,y are already true top-down coords — don't
+    # re-apply the perspective-compensation stretch.
+    new_formations = finalize_frames(
+        new_frames, fps=base.video.fps, refit_y=not base.stage_calibrated
+    )
 
     unique_ids = {d.id for f in new_frames for d in f.dancers}
     counts = [len(f.dancers) for f in new_frames]
@@ -229,6 +240,7 @@ def _rebuild_positions_result(
         summary=new_summary,
         frames=new_frames,
         formations=new_formations,
+        stage_calibrated=base.stage_calibrated,
     )
 
 

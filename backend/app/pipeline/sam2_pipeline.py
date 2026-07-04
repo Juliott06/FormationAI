@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.core.config import get_settings
+from app.pipeline.homography import compute_stage_homography, project_to_stage
 from app.pipeline.pose import normalize_stage_proxy
 from app.pipeline.processor import finalize_frames, inspect_video_file
 from app.schemas.jobs import (
@@ -27,6 +28,7 @@ def tracks_to_frames(
     tracks: dict[str, list[FrameBox]],
     clicks: list[DancerClick],
     video_meta: VideoMetadata,
+    homography: list[list[float]] | None = None,
 ) -> list[FramePositions]:
     """Convert per-name SAM2 tracks into per-frame DancerPosition lists.
 
@@ -35,7 +37,9 @@ def tracks_to_frames(
 
     Multi-click semantics: SAM2 cannot use multiple click points per name on
     the server side, so we collapse duplicate names to the first occurrence
-    here. (CoTracker is the path that actually supports multi-click.)"""
+    here. (CoTracker is the path that actually supports multi-click.)
+
+    homography: if provided, foot anchors map to true top-down floor coords."""
     names = unique_click_names(clicks)
     first_click_by_name = {}
     for click in clicks:
@@ -55,7 +59,12 @@ def tracks_to_frames(
             w = max(fb.x2 - fb.x1, 1)
             h = max(fb.y2 - fb.y1, 1)
             anchor_px = ((fb.x1 + fb.x2) // 2, fb.y2)
-            x, y = normalize_stage_proxy(anchor_px, video_meta.width, video_meta.height)
+            if homography is not None:
+                x, y = project_to_stage(homography, anchor_px)
+            else:
+                x, y = normalize_stage_proxy(
+                    anchor_px, video_meta.width, video_meta.height
+                )
             dancers.append(
                 DancerPosition(
                     id=name_to_id[click.name],
@@ -83,6 +92,7 @@ def process_video_with_sam2(
     clicks: list[DancerClick],
     key_frame: int,
     progress_callback: Callable[[int, int], None],
+    stage_corners: list[list[int]] | None = None,
 ) -> PositionsResult:
     """Run the SAM2 click-to-track pipeline end to end.
 
@@ -94,6 +104,8 @@ def process_video_with_sam2(
     video_meta = inspect_video_file(video_path)
     if not clicks:
         raise ValueError("SAM2 pipeline requires at least one click")
+
+    homography = compute_stage_homography(stage_corners) if stage_corners else None
 
     # SAM2 server expects unique names per click — multi-click is a CoTracker-only
     # feature. Send the first occurrence per name.
@@ -129,7 +141,7 @@ def process_video_with_sam2(
         time.perf_counter() - call_start,
     )
 
-    frames = tracks_to_frames(tracks, clicks, video_meta)
+    frames = tracks_to_frames(tracks, clicks, video_meta, homography)
 
     dancers_per_frame_total = sum(len(f.dancers) for f in frames)
     max_dancers_in_frame = max((len(f.dancers) for f in frames), default=0)
@@ -137,22 +149,27 @@ def process_video_with_sam2(
 
     progress_callback(video_meta.frame_count, max(video_meta.frame_count, 1))
 
-    formations = finalize_frames(frames, fps=video_meta.fps)
+    calibrated = homography is not None
+    formations = finalize_frames(frames, fps=video_meta.fps, refit_y=not calibrated)
 
     frames_below_expected = sum(1 for f in frames if len(f.dancers) < expected)
     frames_meeting_expected = sum(1 for f in frames if len(f.dancers) >= expected)
 
     total_frames = len(frames)
+    coord_note = (
+        "perspective-corrected top-down floor coords from user-marked stage corners"
+        if calibrated
+        else (
+            "auto-fit top-down proxy: y axis stretched to the observed anchor band "
+            "(10th-90th percentile); not floor-plane calibrated"
+        )
+    )
     return PositionsResult(
         job_id=job_id,
         video=video_meta,
         coordinate_space=CoordinateSpaceMetadata(
             image_anchor_px="pixel anchor point in the source frame",
-            normalized_stage_proxy=(
-                "auto-fit top-down proxy: y axis stretched to the observed anchor band "
-                "(10th-90th percentile), occupying the middle 50% of the canvas; "
-                "not floor-plane calibrated"
-            ),
+            normalized_stage_proxy=coord_note,
         ),
         summary=DetectionSummary(
             expected_dancer_count=expected,
@@ -167,4 +184,5 @@ def process_video_with_sam2(
         ),
         frames=frames,
         formations=formations,
+        stage_calibrated=calibrated,
     )

@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from app.pipeline.homography import compute_stage_homography, project_to_stage
 from app.pipeline.pose import normalize_stage_proxy
 from app.pipeline.processor import finalize_frames, inspect_video_file
 from app.schemas.jobs import (
@@ -44,6 +45,7 @@ def tracked_points_to_frames(
     tracks: list[list[TrackedPoint]],
     clicks: list[DancerClick],
     video_meta: VideoMetadata,
+    homography: list[list[float]] | None = None,
 ) -> list[FramePositions]:
     """Convert per-click CoTracker point tracks into per-frame DancerPosition lists.
 
@@ -58,6 +60,9 @@ def tracked_points_to_frames(
     of projected feet across visible points is the dancer's stage anchor.
     This keeps depth stable when only the head/torso is visible — the head
     point's y is mapped to where the foot would be.
+
+    homography: if provided, the foot anchor is mapped through it to true
+    top-down floor coords; otherwise falls back to raw camera-space proxy.
 
     Pure function — easy to unit test."""
     # Roster order: first occurrence of each name is its track_id
@@ -106,7 +111,12 @@ def tracked_points_to_frames(
             bw = min(_SYNTHETIC_BBOX_W, video_meta.width - bx)
             bh = min(_SYNTHETIC_BBOX_H, video_meta.height - by)
             anchor_px = (ax, ay)
-            x, y = normalize_stage_proxy(anchor_px, video_meta.width, video_meta.height)
+            if homography is not None:
+                x, y = project_to_stage(homography, anchor_px)
+            else:
+                x, y = normalize_stage_proxy(
+                    anchor_px, video_meta.width, video_meta.height
+                )
             dancers.append(
                 DancerPosition(
                     id=name_to_id[name],
@@ -134,11 +144,19 @@ def process_video_with_cotracker(
     clicks: list[DancerClick],
     key_frame: int,
     progress_callback: Callable[[int, int], None],
+    stage_corners: list[list[int]] | None = None,
 ) -> PositionsResult:
     """Run the CoTracker click-to-track pipeline end to end."""
     video_meta = inspect_video_file(video_path)
     if not clicks:
         raise ValueError("CoTracker pipeline requires at least one click")
+
+    homography = compute_stage_homography(stage_corners) if stage_corners else None
+    if stage_corners and homography is None:
+        logger.warning(
+            "CoTracker: stage_corners provided but homography was unusable "
+            "(degenerate quad); falling back to camera-space view."
+        )
 
     click_payload = [
         {"name": c.name, "key_frame": key_frame, "x": c.x, "y": c.y} for c in clicks
@@ -146,8 +164,8 @@ def process_video_with_cotracker(
 
     client = build_client()
     logger.info(
-        "CoTracker pipeline: job=%s frames=%d clicks=%d key_frame=%d",
-        job_id, video_meta.frame_count, len(clicks), key_frame,
+        "CoTracker pipeline: job=%s frames=%d clicks=%d key_frame=%d calibrated=%s",
+        job_id, video_meta.frame_count, len(clicks), key_frame, homography is not None,
     )
     progress_callback(0, max(video_meta.frame_count, 1))
 
@@ -158,7 +176,7 @@ def process_video_with_cotracker(
         len(tracks), time.perf_counter() - t0,
     )
 
-    frames = tracked_points_to_frames(tracks, clicks, video_meta)
+    frames = tracked_points_to_frames(tracks, clicks, video_meta, homography)
 
     dancers_per_frame_total = sum(len(f.dancers) for f in frames)
     max_dancers_in_frame = max((len(f.dancers) for f in frames), default=0)
@@ -166,23 +184,28 @@ def process_video_with_cotracker(
 
     progress_callback(video_meta.frame_count, max(video_meta.frame_count, 1))
 
-    formations = finalize_frames(frames, fps=video_meta.fps)
+    calibrated = homography is not None
+    formations = finalize_frames(frames, fps=video_meta.fps, refit_y=not calibrated)
 
     expected = len(unique_click_names(clicks))
     frames_below_expected = sum(1 for f in frames if len(f.dancers) < expected)
     frames_meeting_expected = sum(1 for f in frames if len(f.dancers) >= expected)
 
     total_frames = len(frames)
+    coord_note = (
+        "perspective-corrected top-down floor coords from user-marked stage corners"
+        if calibrated
+        else (
+            "auto-fit top-down proxy: y axis stretched to the observed anchor band "
+            "(10th-90th percentile); not floor-plane calibrated"
+        )
+    )
     return PositionsResult(
         job_id=job_id,
         video=video_meta,
         coordinate_space=CoordinateSpaceMetadata(
             image_anchor_px="pixel anchor point in the source frame",
-            normalized_stage_proxy=(
-                "auto-fit top-down proxy: y axis stretched to the observed anchor band "
-                "(10th-90th percentile), occupying the middle 50% of the canvas; "
-                "not floor-plane calibrated"
-            ),
+            normalized_stage_proxy=coord_note,
         ),
         summary=DetectionSummary(
             expected_dancer_count=expected,
@@ -197,4 +220,5 @@ def process_video_with_cotracker(
         ),
         frames=frames,
         formations=formations,
+        stage_calibrated=calibrated,
     )

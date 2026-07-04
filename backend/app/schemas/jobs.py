@@ -48,6 +48,14 @@ def unique_click_names(clicks: list[DancerClick]) -> list[str]:
 class ClickSeedRequest(BaseModel):
     key_frame: int = Field(ge=0, description="Frame index the clicks were made on")
     clicks: list[DancerClick] = Field(min_length=1)
+    stage_corners: list[list[int]] = Field(
+        default_factory=list,
+        description=(
+            "Optional 4 [x,y] image-pixel corners of the dance floor on the key "
+            "frame. When present, dancer positions are perspective-corrected to a "
+            "true top-down view instead of shown in camera space."
+        ),
+    )
 
 
 class JobRecord(BaseModel):
@@ -58,6 +66,7 @@ class JobRecord(BaseModel):
     roster: list[DancerRosterEntry] = Field(default_factory=list)
     clicks: list[DancerClick] = Field(default_factory=list)
     key_frame: int = Field(default=0, ge=0)
+    stage_corners: list[list[int]] = Field(default_factory=list)
     processed_frames: int = Field(default=0, ge=0)
     total_frames: int = Field(default=0, ge=0)
     error: str | None = None
@@ -209,3 +218,11 @@ class PositionsResult(BaseModel):
     summary: DetectionSummary
     frames: list[FramePositions]
     formations: list[Formation] = Field(default_factory=list)
+    stage_calibrated: bool = Field(
+        default=False,
+        description=(
+            "True when dancer x,y are perspective-corrected top-down floor coords "
+            "(stage corners were provided). When True, the vertical-stretch refit "
+            "must be skipped on any re-processing so coords stay undistorted."
+        ),
+    )
