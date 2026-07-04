@@ -410,6 +410,44 @@ header p {
   font-weight: 600;
 }
 
+.upload-hint {
+  flex-basis: 100%;
+  margin: 0.25rem 0 0 0;
+  color: #6f7682;
+  font-size: 0.8rem;
+}
+
+.click-picker-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.click-secondary {
+  background: transparent;
+  color: #9aa1ab;
+  border: 1px solid #2a3038;
+  border-radius: 4px;
+  padding: 0.5rem 0.9rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.click-secondary:hover:not(:disabled) {
+  border-color: #4a7bff;
+  color: #c8d0dc;
+}
+
+.click-secondary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.corner-overlay {
+  z-index: 1;
+}
+
 .click-picker-stage {
   position: relative;
   width: 100%;

@@ -9,6 +9,7 @@ export interface DancerClick {
 export interface ClickSeedRequest {
   key_frame: number;
   clicks: DancerClick[];
+  stage_corners?: [number, number][];
 }
 
 export interface ReferenceFile {
@@ -120,4 +121,5 @@ export interface PositionsResult {
   summary: DetectionSummary;
   frames: FramePositions[];
   formations: Formation[];
+  stage_calibrated?: boolean;
 }

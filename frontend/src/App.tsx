@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
   CompareToReferenceResponse,
   DancerClick,
-  DancerRosterEntry,
   FramePositions,
   JobStatusResponse,
   PositionsResult,
@@ -43,7 +42,6 @@ export default function App() {
   const [positions, setPositions] = useState<PositionsResult | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [expectedCount, setExpectedCount] = useState<string>('');
-  const [roster, setRoster] = useState<DancerRosterEntry[]>([{ name: '', hint: '' }]);
   const [frameIndex, setFrameIndex] = useState(0);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [merging, setMerging] = useState(false);
@@ -57,6 +55,7 @@ export default function App() {
   // The frame ALL clicks are bound to. Clicks and key_frame must agree, so
   // clicking on a different frame restarts the click set on that frame.
   const [seedFrame, setSeedFrame] = useState<number | null>(null);
+  const [stageCorners, setStageCorners] = useState<[number, number][]>([]);
   const [submittingClicks, setSubmittingClicks] = useState(false);
   const [references, setReferences] = useState<ReferenceFile[]>([]);
   const [referenceFilename, setReferenceFilename] = useState<string>('reference.mp4');
@@ -205,17 +204,12 @@ export default function App() {
     setClicks([]);
     setClickFrame(0);
     setSeedFrame(null);
+    setStageCorners([]);
 
     const formData = new FormData();
     formData.append('file', file);
     if (expectedCount.trim() !== '') {
       formData.append('expected_dancer_count', expectedCount.trim());
-    }
-    const cleanedRoster = roster
-      .map((r) => ({ name: r.name.trim(), hint: r.hint.trim() }))
-      .filter((r) => r.name && r.hint);
-    if (cleanedRoster.length > 0) {
-      formData.append('roster_json', JSON.stringify(cleanedRoster));
     }
 
     try {
@@ -234,6 +228,7 @@ export default function App() {
         setClickFrame(0);
         setClicks([]);
         setSeedFrame(null);
+        setStageCorners([]);
         setPhase('awaiting_clicks');
       } else {
         setPhase('processing');
@@ -282,8 +277,12 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // key_frame is the frame the clicks were MADE on, not the scrubber's
-        // current position.
-        body: JSON.stringify({ key_frame: seedFrame ?? clickFrame, clicks: cleaned }),
+        // current position. stage_corners only sent when all 4 are marked.
+        body: JSON.stringify({
+          key_frame: seedFrame ?? clickFrame,
+          clicks: cleaned,
+          stage_corners: stageCorners.length === 4 ? stageCorners : undefined,
+        }),
       });
       if (!resp.ok) {
         const detail = await resp.text();
@@ -473,62 +472,12 @@ export default function App() {
               disabled={busy}
             />
           </label>
-          <div className="roster-editor">
-            <div className="roster-header">
-              Dancer roster (required if LocateAnything backend is enabled)
-              <span className="roster-hint">
-                Describe each dancer once. The model uses these hints to find &amp; track them by name across the clip.
-              </span>
-            </div>
-            {roster.map((row, i) => (
-              <div key={i} className="roster-row">
-                <input
-                  type="text"
-                  placeholder="name (e.g. Yeji)"
-                  value={row.name}
-                  disabled={busy}
-                  onChange={(e) =>
-                    setRoster((rs) =>
-                      rs.map((r, j) => (j === i ? { ...r, name: e.target.value } : r)),
-                    )
-                  }
-                />
-                <input
-                  type="text"
-                  placeholder="appearance hint (e.g. dancer in white top with black pants)"
-                  value={row.hint}
-                  disabled={busy}
-                  onChange={(e) =>
-                    setRoster((rs) =>
-                      rs.map((r, j) => (j === i ? { ...r, hint: e.target.value } : r)),
-                    )
-                  }
-                />
-                <button
-                  type="button"
-                  className="roster-remove"
-                  disabled={busy || roster.length === 1}
-                  onClick={() =>
-                    setRoster((rs) => (rs.length > 1 ? rs.filter((_, j) => j !== i) : rs))
-                  }
-                  aria-label="Remove dancer"
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-            <button
-              type="button"
-              className="roster-add"
-              disabled={busy}
-              onClick={() => setRoster((rs) => [...rs, { name: '', hint: '' }])}
-            >
-              + Add dancer
-            </button>
-          </div>
           <button type="submit" disabled={busy}>
             {phase === 'uploading' ? 'Uploading…' : 'Upload & process'}
           </button>
+          <p className="upload-hint">
+            After uploading you'll mark the floor corners and click each dancer.
+          </p>
         </form>
       </section>
 
@@ -560,6 +509,11 @@ export default function App() {
           onRemoveClick={(idx) =>
             setClicks((prev) => prev.filter((_, i) => i !== idx))
           }
+          stageCorners={stageCorners}
+          onAddCorner={(pt) =>
+            setStageCorners((prev) => (prev.length < 4 ? [...prev, pt] : prev))
+          }
+          onClearCorners={() => setStageCorners([])}
           onSubmit={handleSubmitClicks}
           submitting={submittingClicks}
         />
@@ -897,6 +851,8 @@ function Metric({
   );
 }
 
+type PickMode = 'corners' | 'dancers';
+
 function ClickPicker({
   jobId,
   videoMeta,
@@ -907,6 +863,9 @@ function ClickPicker({
   onAddClick,
   onUpdateClick,
   onRemoveClick,
+  stageCorners,
+  onAddCorner,
+  onClearCorners,
   onSubmit,
   submitting,
 }: {
@@ -919,10 +878,16 @@ function ClickPicker({
   onAddClick: (c: DancerClick) => void;
   onUpdateClick: (idx: number, partial: Partial<DancerClick>) => void;
   onRemoveClick: (idx: number) => void;
+  stageCorners: [number, number][];
+  onAddCorner: (pt: [number, number]) => void;
+  onClearCorners: () => void;
   onSubmit: () => void;
   submitting: boolean;
 }) {
   const imgRef = useRef<HTMLImageElement | null>(null);
+  // Two phases: first mark the floor corners, then click the dancers.
+  const [mode, setMode] = useState<PickMode>('corners');
+  const [cornersDone, setCornersDone] = useState(false);
   // The slider updates a local value on every tick; the actual frame (which
   // triggers a backend video-decode per change) commits after a short pause,
   // so dragging doesn't fire hundreds of frame-extraction requests.
@@ -971,51 +936,74 @@ function ClickPicker({
     return null;
   }
 
-  function handleImgClick(event: React.MouseEvent<HTMLImageElement>) {
+  function eventToImagePx(event: React.MouseEvent<HTMLImageElement>): [number, number] | null {
     const img = imgRef.current;
-    if (!img) return;
+    if (!img) return null;
     const rect = img.getBoundingClientRect();
-    const cssX = event.clientX - rect.left;
-    const cssY = event.clientY - rect.top;
     const scaleX = videoMeta.width / rect.width;
     const scaleY = videoMeta.height / rect.height;
-    const px = Math.max(0, Math.min(videoMeta.width - 1, Math.round(cssX * scaleX)));
-    const py = Math.max(0, Math.min(videoMeta.height - 1, Math.round(cssY * scaleY)));
+    const px = Math.max(0, Math.min(videoMeta.width - 1, Math.round((event.clientX - rect.left) * scaleX)));
+    const py = Math.max(0, Math.min(videoMeta.height - 1, Math.round((event.clientY - rect.top) * scaleY)));
+    return [px, py];
+  }
+
+  function handleImgClick(event: React.MouseEvent<HTMLImageElement>) {
+    const pt = eventToImagePx(event);
+    if (!pt) return;
+    if (mode === 'corners') {
+      if (stageCorners.length < 4) onAddCorner(pt);
+      return;
+    }
     if (event.shiftKey) {
       const target = lastNamedClick();
       if (target) {
-        onAddClick({ name: target.name, x: px, y: py });
+        onAddClick({ name: target.name, x: pt[0], y: pt[1] });
         return;
       }
     }
-    onAddClick({ name: '', x: px, y: py });
+    onAddClick({ name: '', x: pt[0], y: pt[1] });
   }
+
+  const rect = imgRef.current?.getBoundingClientRect();
+  const toCss = (x: number, y: number): [number, number] =>
+    rect ? [(x / videoMeta.width) * rect.width, (y / videoMeta.height) * rect.height] : [0, 0];
 
   return (
     <section className="click-picker">
-      <div className="click-picker-header">
-        <strong>Click each dancer, then name them.</strong>
-        <span>
-          Tracking runs from the clicked frame <strong>forward</strong> — pick a frame
-          near the start where every dancer is visible. Frames before your click frame
-          won't be tracked. <strong>Shift+Click</strong> adds a second point on the
-          most-recently-named dancer (e.g. head + torso) — useful when they get
-          occluded behind another dancer. All clicks must be on the same frame;
-          clicking on a different frame restarts the set there.
-        </span>
-        {seedFrame !== null && (
-          <span className="seed-frame-note">
-            Seeding on frame {seedFrame}
-            {seedFrame > videoMeta.frame_count * 0.1 && (
-              <strong>
-                {' '}
-                — warning: the first {(seedFrame / Math.max(videoMeta.fps, 1)).toFixed(1)}s
-                of the video will have no tracking. Consider an earlier frame.
-              </strong>
-            )}
+      {mode === 'corners' ? (
+        <div className="click-picker-header">
+          <strong>Step 1 — Mark the dance floor ({stageCorners.length}/4 corners)</strong>
+          <span>
+            Click the <strong>4 corners of the floor</strong> (back-left, back-right,
+            front-right, front-left). This lets us show a true top-down view instead of
+            the angled camera view, so formations aren't distorted. Click order doesn't
+            matter — we sort them automatically.
           </span>
-        )}
-      </div>
+        </div>
+      ) : (
+        <div className="click-picker-header">
+          <strong>Step 2 — Click each dancer, then name them.</strong>
+          <span>
+            Tracking runs from the clicked frame <strong>forward</strong> — pick a frame
+            near the start where every dancer is visible. <strong>Shift+Click</strong>{' '}
+            adds a second point on the most-recently-named dancer (e.g. head + torso) —
+            useful when they get occluded. All dancer clicks must be on the same frame;
+            clicking a different frame restarts the set there.
+          </span>
+          {seedFrame !== null && (
+            <span className="seed-frame-note">
+              Seeding on frame {seedFrame}
+              {seedFrame > videoMeta.frame_count * 0.1 && (
+                <strong>
+                  {' '}
+                  — warning: the first {(seedFrame / Math.max(videoMeta.fps, 1)).toFixed(1)}s
+                  of the video will have no tracking. Consider an earlier frame.
+                </strong>
+              )}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="click-picker-stage">
         <img
@@ -1024,12 +1012,42 @@ function ClickPicker({
           alt={`frame ${frame}`}
           onClick={handleImgClick}
           draggable={false}
+          style={{ cursor: 'crosshair' }}
         />
-        {imgRef.current &&
+        {/* Floor quad overlay */}
+        {rect && stageCorners.length > 0 && (
+          <svg
+            className="corner-overlay"
+            width={rect.width}
+            height={rect.height}
+            style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none' }}
+          >
+            {stageCorners.length >= 2 && (
+              <polygon
+                points={stageCorners.map(([x, y]) => toCss(x, y).join(',')).join(' ')}
+                fill="rgba(74,123,255,0.15)"
+                stroke="#4a7bff"
+                strokeWidth={2}
+              />
+            )}
+            {stageCorners.map(([x, y], i) => {
+              const [cx, cy] = toCss(x, y);
+              return (
+                <g key={i}>
+                  <circle cx={cx} cy={cy} r={7} fill="#4a7bff" stroke="#fff" strokeWidth={2} />
+                  <text x={cx} y={cy - 10} fill="#fff" fontSize={11} textAnchor="middle">
+                    {i + 1}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        )}
+        {/* Dancer markers (only in dancer mode) */}
+        {rect &&
+          mode === 'dancers' &&
           clicks.map((c, i) => {
-            const rect = imgRef.current!.getBoundingClientRect();
-            const sx = (c.x / videoMeta.width) * rect.width;
-            const sy = (c.y / videoMeta.height) * rect.height;
+            const [sx, sy] = toCss(c.x, c.y);
             const name = c.name.trim();
             const ptIdx = name ? pointIndexForClick(i) : 0;
             const label = name ? (ptIdx > 1 ? `${name}·${ptIdx}` : name) : `#${i + 1}`;
@@ -1063,58 +1081,104 @@ function ClickPicker({
         </span>
       </div>
 
-      <div className="click-list">
-        {clicks.length === 0 && (
-          <div className="click-list-empty">
-            No clicks yet. Click on a dancer in the image above to start.
+      {mode === 'corners' ? (
+        <div className="click-picker-actions">
+          <button
+            type="button"
+            className="click-submit"
+            disabled={stageCorners.length !== 4}
+            onClick={() => {
+              setCornersDone(true);
+              setMode('dancers');
+            }}
+          >
+            {stageCorners.length === 4
+              ? 'Use these corners → click dancers'
+              : `Mark ${4 - stageCorners.length} more corner${4 - stageCorners.length === 1 ? '' : 's'}`}
+          </button>
+          {stageCorners.length > 0 && (
+            <button type="button" className="click-secondary" onClick={onClearCorners}>
+              Clear corners
+            </button>
+          )}
+          <button
+            type="button"
+            className="click-secondary"
+            onClick={() => {
+              onClearCorners();
+              setCornersDone(true);
+              setMode('dancers');
+            }}
+          >
+            Skip — use camera view (formations may look angled)
+          </button>
+        </div>
+      ) : (
+        <>
+          <div className="click-list">
+            {clicks.length === 0 && (
+              <div className="click-list-empty">
+                No dancers yet. Click on a dancer in the image above to start.
+              </div>
+            )}
+            {clicks.map((c, i) => {
+              const name = c.name.trim();
+              const ptIdx = name ? pointIndexForClick(i) : 0;
+              const chipText = name ? (ptIdx > 1 ? `${name}·${ptIdx}` : name) : `#${i + 1}`;
+              return (
+                <div key={i} className="click-row">
+                  <span
+                    className="click-chip"
+                    style={{ background: name ? colorForName(name) : colorForTrack(clicks.length + i + 1) }}
+                  >
+                    {chipText}
+                  </span>
+                  <input
+                    type="text"
+                    placeholder="dancer name (e.g. Yeji)"
+                    value={c.name}
+                    onChange={(e) => onUpdateClick(i, { name: e.target.value })}
+                    disabled={submitting}
+                  />
+                  <span className="click-coords">
+                    ({c.x}, {c.y})
+                  </span>
+                  <button
+                    type="button"
+                    className="click-remove"
+                    disabled={submitting}
+                    onClick={() => onRemoveClick(i)}
+                    aria-label="Remove dancer"
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
           </div>
-        )}
-        {clicks.map((c, i) => {
-          const name = c.name.trim();
-          const ptIdx = name ? pointIndexForClick(i) : 0;
-          const chipText = name ? (ptIdx > 1 ? `${name}·${ptIdx}` : name) : `#${i + 1}`;
-          return (
-            <div key={i} className="click-row">
-              <span
-                className="click-chip"
-                style={{ background: name ? colorForName(name) : colorForTrack(clicks.length + i + 1) }}
-              >
-                {chipText}
-              </span>
-              <input
-                type="text"
-                placeholder="dancer name (e.g. Yeji)"
-                value={c.name}
-                onChange={(e) => onUpdateClick(i, { name: e.target.value })}
-                disabled={submitting}
-              />
-              <span className="click-coords">
-                ({c.x}, {c.y})
-              </span>
-              <button
-                type="button"
-                className="click-remove"
-                disabled={submitting}
-                onClick={() => onRemoveClick(i)}
-                aria-label="Remove click"
-              >
-                ×
-              </button>
-            </div>
-          );
-        })}
-      </div>
 
-      <button
-        type="button"
-        className="click-submit"
-        disabled={submitting || nameOrder.length === 0}
-        onClick={onSubmit}
-      >
-        {submitting
-          ? 'Processing…'
-          : `Start processing (${nameOrder.length} dancer${nameOrder.length === 1 ? '' : 's'}, ${clicks.length} point${clicks.length === 1 ? '' : 's'})`}
-      </button>
+          <div className="click-picker-actions">
+            <button
+              type="button"
+              className="click-submit"
+              disabled={submitting || nameOrder.length === 0}
+              onClick={onSubmit}
+            >
+              {submitting
+                ? 'Processing…'
+                : `Start processing (${nameOrder.length} dancer${nameOrder.length === 1 ? '' : 's'}, ${clicks.length} point${clicks.length === 1 ? '' : 's'})`}
+            </button>
+            <button
+              type="button"
+              className="click-secondary"
+              disabled={submitting}
+              onClick={() => setMode('corners')}
+            >
+              {cornersDone && stageCorners.length === 4 ? 'Redo floor corners' : 'Mark floor corners'}
+            </button>
+          </div>
+        </>
+      )}
     </section>
   );
 }
