@@ -17,6 +17,52 @@ _CODEC_FALLBACK = [
 ]
 
 
+def ensure_web_playable(path: Path) -> Path:
+    """Transcode a video to H.264 so browsers can play it in a <video> tag.
+
+    OpenCV's VideoWriter typically produces mp4v (MPEG-4 Part 2) or AVI, which
+    no mainstream browser decodes — the player renders black with nothing to
+    play. Uses the ffmpeg binary bundled with imageio-ffmpeg. Returns the
+    playable path; on any failure returns the original file unchanged (the
+    metrics and download still work, only inline playback suffers)."""
+    import subprocess
+
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        logger.warning("imageio-ffmpeg unavailable — %s left as-is", path.name)
+        return path
+
+    tmp = path.with_name(path.stem + "_h264.mp4")
+    cmd = [
+        ffmpeg, "-y", "-i", str(path),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-an", str(tmp),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            logger.warning(
+                "h264 transcode failed for %s (rc=%d): %s",
+                path.name, result.returncode, result.stderr[-300:].decode(errors="replace"),
+            )
+            tmp.unlink(missing_ok=True)
+            return path
+    except Exception as exc:
+        logger.warning("h264 transcode error for %s: %s", path.name, exc)
+        tmp.unlink(missing_ok=True)
+        return path
+
+    final = path.with_suffix(".mp4")
+    path.unlink(missing_ok=True)
+    tmp.replace(final)
+    logger.info("transcoded %s to browser-playable H.264", final.name)
+    return final
+
+
 def _color_for_track(track_id: int) -> tuple[int, int, int]:
     """BGR color derived from track_id. Matches DebugVideoRenderer's scheme."""
     blue = (track_id * 97) % 255

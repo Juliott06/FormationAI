@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     sam2_timeout_sec: float = 600.0
     cotracker_backend: Literal["disabled", "local"] = "disabled"
     cotracker_resize_width: int = 960
+    # Foot assist: match tracked click points to YOLO person boxes so depth
+    # comes from real feet (bbox bottoms) instead of torso points, which sit
+    # near the camera horizon and carry almost no depth signal.
+    cotracker_foot_assist: bool = True
+    foot_assist_sample_every: int = 3
 
     model_config = SettingsConfigDict(
         env_prefix="FORMATIONAI_",

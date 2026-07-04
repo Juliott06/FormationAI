@@ -10,7 +10,11 @@ from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.pipeline.processor import apply_id_merge, apply_id_swap, apply_labels, inspect_video_file
-from app.pipeline.stage_renderer import concat_side_by_side, render_stage_video
+from app.pipeline.stage_renderer import (
+    concat_side_by_side,
+    ensure_web_playable,
+    render_stage_video,
+)
 from app.schemas.jobs import (
     ClickSeedRequest,
     CompareMetrics,
@@ -720,6 +724,9 @@ def compare_to_reference(
             output_path=comparison_path,
             left_crop=crop,
         )
+        # OpenCV writes mp4v, which browsers can't decode in a <video> tag —
+        # transcode to H.264 so the inline player actually plays.
+        comparison_path = ensure_web_playable(comparison_path)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

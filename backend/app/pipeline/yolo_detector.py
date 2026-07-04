@@ -92,6 +92,39 @@ class YoloPersonDetector:
 
         self._model = YOLO(self.model_name)
 
+    def detect(self, frame_bgr: Any) -> list[Detection]:
+        """Detection only — no tracker state. Used by foot-assist, which needs
+        person boxes for geometry while identity comes from elsewhere."""
+        self._ensure_model()
+        assert self._model is not None
+
+        results = self._model.predict(
+            source=frame_bgr,
+            classes=[0],
+            conf=self.confidence_threshold,
+            iou=self.iou_threshold,
+            imgsz=self.image_size,
+            max_det=self.max_detections,
+            device=self.device,
+            verbose=False,
+        )
+        if not results:
+            return []
+        boxes = getattr(results[0], "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            return []
+        frame_height, frame_width = frame_bgr.shape[:2]
+        raw = [
+            RawBox(
+                xyxy=(float(r[0]), float(r[1]), float(r[2]), float(r[3])),
+                confidence=float(c),
+            )
+            for r, c in zip(boxes.xyxy.cpu().tolist(), boxes.conf.cpu().tolist())
+        ]
+        return raw_boxes_to_detections(
+            raw, frame_width=frame_width, frame_height=frame_height
+        )
+
     def track(self, frame_bgr: Any, timestamp_ms: int) -> list[TrackedDetection]:
         del timestamp_ms  # Ultralytics tracker uses internal frame counters.
         self._ensure_model()

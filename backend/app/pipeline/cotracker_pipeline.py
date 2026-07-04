@@ -18,9 +18,12 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from app.core.config import get_settings
+from app.pipeline.foot_assist import compute_foot_anchors, representative_points
 from app.pipeline.homography import compute_stage_homography, project_to_stage
 from app.pipeline.pose import normalize_stage_proxy
 from app.pipeline.processor import apply_stage_rescue, finalize_frames, inspect_video_file
+from app.pipeline.yolo_detector import YoloPersonDetector
 from app.schemas.jobs import (
     CoordinateSpaceMetadata,
     DancerClick,
@@ -46,6 +49,7 @@ def tracked_points_to_frames(
     clicks: list[DancerClick],
     video_meta: VideoMetadata,
     homography: list[list[float]] | None = None,
+    foot_anchors: dict[str, list[tuple[int, int] | None]] | None = None,
 ) -> list[FramePositions]:
     """Convert per-click CoTracker point tracks into per-frame DancerPosition lists.
 
@@ -63,6 +67,11 @@ def tracked_points_to_frames(
 
     homography: if provided, the foot anchor is mapped through it to true
     top-down floor coords; otherwise falls back to raw camera-space proxy.
+
+    foot_anchors: optional per-name per-frame FOOT positions from foot-assist
+    (YOLO bbox bottoms). When present for a (name, frame), it overrides the
+    click-offset estimate — tracked torso points near the camera's horizon
+    carry almost no depth signal, so real feet matter for depth accuracy.
 
     Pure function — easy to unit test."""
     # Roster order: first occurrence of each name is its track_id
@@ -86,22 +95,30 @@ def tracked_points_to_frames(
     for fi in range(video_meta.frame_count):
         dancers: list[DancerPosition] = []
         for name in unique_names:
-            projected_ys: list[int] = []
-            xs: list[int] = []
-            for click_idx in name_to_indices[name]:
-                if fi >= len(tracks[click_idx]):
+            assist = None
+            if foot_anchors is not None:
+                series = foot_anchors.get(name)
+                if series is not None and fi < len(series):
+                    assist = series[fi]
+            if assist is not None:
+                ax, ay = assist
+            else:
+                projected_ys: list[int] = []
+                xs: list[int] = []
+                for click_idx in name_to_indices[name]:
+                    if fi >= len(tracks[click_idx]):
+                        continue
+                    pt = tracks[click_idx][fi]
+                    if pt is None or not pt.visible:
+                        continue
+                    projected_ys.append(pt.y + foot_offset_per_click[click_idx])
+                    xs.append(pt.x)
+                if not projected_ys:
                     continue
-                pt = tracks[click_idx][fi]
-                if pt is None or not pt.visible:
-                    continue
-                projected_ys.append(pt.y + foot_offset_per_click[click_idx])
-                xs.append(pt.x)
-            if not projected_ys:
-                continue
-            projected_ys.sort()
-            xs.sort()
-            ay = projected_ys[len(projected_ys) // 2]
-            ax = xs[len(xs) // 2]
+                projected_ys.sort()
+                xs.sort()
+                ay = projected_ys[len(projected_ys) // 2]
+                ax = xs[len(xs) // 2]
             ay = max(0, min(video_meta.height - 1, ay))
             ax = max(0, min(video_meta.width - 1, ax))
             half_w = _SYNTHETIC_BBOX_W // 2
@@ -176,7 +193,37 @@ def process_video_with_cotracker(
         len(tracks), time.perf_counter() - t0,
     )
 
-    frames = tracked_points_to_frames(tracks, clicks, video_meta, homography)
+    settings = get_settings()
+    foot_anchors = None
+    if settings.cotracker_foot_assist:
+        try:
+            detector = YoloPersonDetector(
+                model_name=settings.yolo_model_name,
+                confidence_threshold=settings.yolo_confidence_threshold,
+                iou_threshold=settings.yolo_iou_threshold,
+                image_size=settings.yolo_image_size,
+                max_detections=settings.yolo_max_detections,
+                device=settings.yolo_device,
+                tracker_config=settings.tracker_config,
+            )
+            rep = representative_points(tracks, [c.name for c in clicks])
+            t1 = time.perf_counter()
+            foot_anchors = compute_foot_anchors(
+                video_path,
+                rep,
+                detector=detector,
+                sample_every=settings.foot_assist_sample_every,
+            )
+            logger.info("foot assist done in %.1fs", time.perf_counter() - t1)
+        except Exception:
+            logger.exception(
+                "foot assist failed — falling back to tracked points for anchors"
+            )
+            foot_anchors = None
+
+    frames = tracked_points_to_frames(
+        tracks, clicks, video_meta, homography, foot_anchors
+    )
     if homography is not None:
         apply_stage_rescue(frames)
 
