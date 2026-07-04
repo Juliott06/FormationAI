@@ -18,6 +18,12 @@ from __future__ import annotations
 
 Corner = tuple[float, float]
 
+# The marked floor quad maps to the middle of stage space, not the exact edges.
+# Users eyeball the corners, and dancers routinely step slightly outside the
+# marked floor — with a hard 0..1 mapping those feet clamp onto the canvas
+# border and look cut off. The margin keeps them visible.
+STAGE_MARGIN = 0.1
+
 
 def _order_corners(corners: list[Corner]) -> list[Corner]:
     """Sort 4 image-space points into [back-left, back-right, front-right, front-left].
@@ -42,8 +48,10 @@ def compute_stage_homography(corners: list[list[int]] | list[Corner]) -> list[li
     if corners is None or len(corners) != 4:
         return None
     src = _order_corners([(float(x), float(y)) for x, y in corners])
-    # Destination in stage space: back-left, back-right, front-right, front-left
-    dst = [(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
+    # Destination in stage space: back-left, back-right, front-right, front-left,
+    # inset by STAGE_MARGIN (see comment above).
+    lo, hi = STAGE_MARGIN, 1.0 - STAGE_MARGIN
+    dst = [(lo, hi), (hi, hi), (hi, lo), (lo, lo)]
 
     # Reject degenerate quads (near-collinear / zero area via the shoelace formula).
     area = 0.0

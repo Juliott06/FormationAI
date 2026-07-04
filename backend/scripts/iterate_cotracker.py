@@ -61,6 +61,8 @@ def main() -> int:
     parser.add_argument("--clicks-json", required=True,
                         help='JSON list of {"name","x","y","key_frame"}')
     parser.add_argument("--clip-seconds", type=float, default=None)
+    parser.add_argument("--corners-json", default=None,
+                        help='JSON list of 4 [x,y] floor corners (full-res px)')
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -120,12 +122,14 @@ def main() -> int:
             "starting CoTracker pipeline: %d frames, %d clicks, key_frame=%d",
             video_meta.frame_count, len(clicks), key_frame,
         )
+        stage_corners = json.loads(args.corners_json) if args.corners_json else None
         t0 = time.perf_counter()
         positions = process_video_with_cotracker(
             job_id=job_id,
             video_path=video_path,
             clicks=clicks,
             key_frame=key_frame,
+            stage_corners=stage_corners,
             progress_callback=progress_cb,
         )
         elapsed = time.perf_counter() - t0
