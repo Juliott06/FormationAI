@@ -50,10 +50,11 @@ _W_APPEAR = 2.5
 _W_POINTS = 0.6
 _W_SCALE = 0.3
 _MAX_COST = 3.0
-_MOTION_GATE = 1.5  # box heights, base
-_MOTION_GATE_GROWTH = 0.1  # extra per frame the dancer has been lost
-_MOTION_GATE_MAX = 4.0
-_VEL_DAMP = 0.85  # per-frame velocity decay while coasting
+_MOTION_GATE = 1.0  # box heights, base
+_MOTION_GATE_GROWTH = 0.04  # extra per frame the dancer has been lost
+_MOTION_GATE_MAX = 2.0  # a hidden dancer reappears near where she vanished
+_MAX_SPEED = 0.06  # box heights per frame (~1.8 body heights/s at 30fps)
+_VEL_DAMP = 0.7  # per-frame velocity decay while coasting blind
 _DEFECT_FRAMES = 8  # consecutive frames inside another dancer's box
 _CLEAN_IOU = 0.08  # box overlapping others less than this = unoccluded
 _TEMPLATE_RATE = 0.05
@@ -93,6 +94,30 @@ def appearance_distance(a, b) -> float:
     import numpy as np
 
     return float(np.sqrt(max(0.0, 1.0 - float(np.sqrt(a * b).sum()) / 3.0)))
+
+
+def _clamp_vel(vx: float, vy: float, h: float) -> tuple[float, float]:
+    """Limit predicted speed: a coasting estimate must not run away (observed:
+    a hidden dancer's prediction flew off-screen and then grabbed boxes on the
+    far side of the stage)."""
+    lim = _MAX_SPEED * max(h, 1.0)
+    sp = (vx * vx + vy * vy) ** 0.5
+    if sp <= lim:
+        return vx, vy
+    return vx * lim / sp, vy * lim / sp
+
+
+def _is_identity(m) -> bool:
+    import numpy as np
+
+    return bool(np.allclose(np.asarray(m), np.eye(3)))
+
+
+def _invert(m) -> list[list[float]]:
+    import numpy as np
+
+    inv = np.linalg.inv(np.asarray(m, dtype=np.float64))
+    return (inv / inv[2, 2]).tolist()
 
 
 def _iou(a: Box, b: Box) -> float:
@@ -136,6 +161,7 @@ class IdentityResult:
     defected_points: int
     camera_moving: bool = False
     feet_image: dict[str, list[Point | None]] | None = None  # raw image coords, for overlays
+
 
 
 def assign_detections(
@@ -263,6 +289,23 @@ def run_identity_tracking(
                         if i in point_pos:
                             d.offsets[i] = (d.foot[0] - point_pos[i][0], d.foot[1] - point_pos[i][1])
 
+            # Track the camera BEFORE assigning: if it panned/zoomed since the
+            # last frame, move every dancer's predicted position (and scale)
+            # into this frame's view. Otherwise a zoom makes everyone appear
+            # to rush outward and predictions point at the wrong person.
+            if estimator is not None:
+                estimator.add_frame(raw_frame, last_boxes)
+                step = estimator.steps[-1]  # maps this frame -> previous frame
+                if fi > key_frame and not _is_identity(step):
+                    inv = _invert(step)
+                    zoom = abs(inv[0][0] * inv[1][1] - inv[0][1] * inv[1][0]) ** 0.5
+                    for d in dancers:
+                        nx, ny = apply_h(inv, d.foot[0], d.foot[1])
+                        vx, vy = apply_h(inv, d.foot[0] + d.vel[0], d.foot[1] + d.vel[1])
+                        d.foot = (nx, ny)
+                        d.vel = (vx - nx, vy - ny)
+                        d.h *= zoom
+
             assignment: dict[int, int] = {}
             boxes: list[Box] = []
             if frame is not None:
@@ -295,9 +338,6 @@ def run_identity_tracking(
                         elif in_own:
                             defect_run[i] = 0
 
-            if estimator is not None:
-                estimator.add_frame(raw_frame, last_boxes)
-
             for di, d in enumerate(dancers):
                 trusted_pts = [
                     (i, point_pos[i]) for i in d.point_idx if trusted[i] and i in point_pos
@@ -314,7 +354,7 @@ def run_identity_tracking(
                     if d.lost > 0:
                         reassigned += 1
                     nv = (fx - d.foot[0], fy - d.foot[1])
-                    d.vel = (0.5 * d.vel[0] + 0.5 * nv[0], 0.5 * d.vel[1] + 0.5 * nv[1])
+                    d.vel = _clamp_vel(0.5 * d.vel[0] + 0.5 * nv[0], 0.5 * d.vel[1] + 0.5 * nv[1], d.h)
                     d.foot = (fx, fy)
                     d.h = 0.8 * d.h + 0.2 * h
                     d.lost = 0
@@ -340,12 +380,18 @@ def run_identity_tracking(
                     for i, p in trusted_pts
                     if i in d.offsets
                 ]
+                px_, py_ = d.foot[0] + d.vel[0], d.foot[1] + d.vel[1]
                 if est:
                     xs = sorted(e[0] for e in est)
                     ys = sorted(e[1] for e in est)
                     fx, fy = xs[len(xs) // 2], ys[len(ys) // 2]
+                    # Points that put her implausibly far from where she was
+                    # are probably latched onto someone else — don't follow.
+                    if ((fx - px_) ** 2 + (fy - py_) ** 2) ** 0.5 > 0.5 * d.h:
+                        est = []
+                if est:
                     nv = (fx - d.foot[0], fy - d.foot[1])
-                    d.vel = (0.5 * d.vel[0] + 0.5 * nv[0], 0.5 * d.vel[1] + 0.5 * nv[1])
+                    d.vel = _clamp_vel(0.5 * d.vel[0] + 0.5 * nv[0], 0.5 * d.vel[1] + 0.5 * nv[1], d.h)
                     d.foot = (fx, fy)
                     feet[d.name][fi] = (int(round(fx)), int(round(fy)))
                 else:
