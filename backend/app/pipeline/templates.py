@@ -67,6 +67,18 @@ def generate_templates_for_count(n: int) -> list[FormationTemplate]:
     v_pts = np.array(v_list)
     templates.append(FormationTemplate("V", v_pts))
 
+    # Centre front / centre back: one dancer in the middle ahead of (or
+    # behind) a row of everyone else — the K-pop "centre position" layout.
+    if n >= 4:
+        row = [[(i / (n - 2)) * 2 - 1, 0.5] for i in range(n - 1)]
+        templates.append(FormationTemplate("Centre front", np.array([[0.0, -0.5]] + row)))
+        flipped = [[x, -y] for x, y in row]
+        templates.append(FormationTemplate("Centre back", np.array([[0.0, 0.5]] + flipped)))
+    if n == 4:
+        templates.append(
+            FormationTemplate("Diamond", np.array([[0.0, -1.0], [-1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]))
+        )
+
     # Inverted V (point at the back)
     inv_v = v_pts.copy()
     inv_v[:, 1] *= -1

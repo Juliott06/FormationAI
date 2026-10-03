@@ -325,3 +325,10 @@ def test_auto_ground_recovers_floor_without_corners():
     sx = np.polyfit(tx, est[:, 0], 1)[0]
     sz = np.polyfit(tz, est[:, 1], 1)[0]
     assert abs(sx / sz - 1.0) < 0.03
+
+
+def test_centre_front_formation_is_named():
+    # One dancer centre-front, three in a row behind: the K-pop centre spot.
+    f = _formation([(0.5, 0.35), (0.3, 0.55), (0.5, 0.56), (0.7, 0.55)])
+    _snap_formations_to_templates([f], threshold=0.08)
+    assert f.shape_name in ("Centre front", "Diamond")
