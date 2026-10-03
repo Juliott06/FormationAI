@@ -197,6 +197,7 @@ def compute_foot_anchors(
     detector: _Detector,
     sample_every: int = 3,
     initial_offsets: dict[str, tuple[int, int]] | None = None,
+    box_samples: list[tuple[float, float]] | None = None,
 ) -> dict[str, list[Point | None]]:
     """For each dancer and frame, the estimated FOOT position (None where the
     dancer isn't tracked, or where no foot estimate exists at all — callers
@@ -211,7 +212,10 @@ def compute_foot_anchors(
     use the foot-prediction gate, and is the fallback for a dancer YOLO never
     matches. A dancer with neither gets None — NOT their raw tracked point,
     which would put a torso where the feet belong and shove them to the back
-    of the stage."""
+    of the stage.
+
+    box_samples: if given, (foot_v, box_height) of every matched box is
+    appended — the input for corner-free floor calibration (auto_ground)."""
     import cv2
 
     n_frames = max((len(s) for s in rep_points.values()), default=0)
@@ -243,7 +247,13 @@ def compute_foot_anchors(
                 break
             sample_count += 1
             boxes = detector.detect(frame)
-            matched = match_points_to_boxes(frame_points, boxes, current)  # type: ignore[arg-type]
+            assigned = _assign_boxes(frame_points, boxes, current)  # type: ignore[arg-type]
+            matched = {}
+            for name, bi in assigned.items():
+                bx, by, bw, bh = boxes[bi].bbox
+                matched[name] = (bx + bw // 2, by + bh)
+                if box_samples is not None:
+                    box_samples.append((float(by + bh), float(bh)))
             match_count += len(matched)
             for name, foot in matched.items():
                 px, py = frame_points[name]  # type: ignore[misc]

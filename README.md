@@ -42,6 +42,9 @@ for the full tuning history that led here.
 4. For a dancer who often gets hidden behind others (e.g. a back-row member),
    **Shift+Click** a second point on them (their head or torso). If any of a
    dancer's points is visible, they stay on the stage.
+   **Floor corners are optional.** If all four corners of the floor are
+   visible you can mark them; otherwise skip that step and the top-down view
+   is calibrated automatically from the dancers' apparent heights.
 5. Click **Start processing**. The tracker runs, then the stage view renders.
 
 After processing you can still hand-correct: merge two IDs that are the same

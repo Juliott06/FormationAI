@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.core.config import get_settings
+from app.pipeline.auto_ground import fit_floor_to_stage, fit_ground_model
 from app.pipeline.foot_assist import (
     compute_foot_anchors,
     match_clicks_to_boxes,
@@ -275,6 +276,25 @@ def add_support_points(
     return out
 
 
+def apply_ground_model(frames: list[FramePositions], model) -> None:
+    """Replace each dancer's x,y with floor coords from the auto-calibrated
+    ground model, fitted onto the stage with one uniform metric scale."""
+    hom = model.to_homography()
+    floor: list[tuple[float, float]] = []
+    for f in frames:
+        for d in f.dancers:
+            floor.append(project_to_stage(hom, (d.anchor_px[0], d.anchor_px[1])))
+    if not floor:
+        return
+    sx, sy, ox, oy = fit_floor_to_stage(floor)
+    it = iter(floor)
+    for f in frames:
+        for d in f.dancers:
+            fx, fz = next(it)
+            d.x = round(min(max(sx * fx + ox, 0.0), 1.0), 6)
+            d.y = round(min(max(sy * fz + oy, 0.0), 1.0), 6)
+
+
 def process_video_with_cotracker(
     *,
     job_id: str,
@@ -352,6 +372,9 @@ def process_video_with_cotracker(
     )
 
     foot_anchors = None
+    box_samples: list[tuple[float, float]] = [
+        (float(by + bh), float(bh)) for (_bx, by, _bw, bh) in key_boxes.values()
+    ]
     if detector is not None:
         try:
             rep = representative_points(tracks, [c.name for c in track_clicks])
@@ -368,6 +391,7 @@ def process_video_with_cotracker(
                 detector=detector,
                 sample_every=settings.foot_assist_sample_every,
                 initial_offsets=initial_offsets,
+                box_samples=box_samples,
             )
             logger.info("foot assist done in %.1fs", time.perf_counter() - t1)
         except Exception:
@@ -379,8 +403,14 @@ def process_video_with_cotracker(
     frames = tracked_points_to_frames(
         tracks, track_clicks, video_meta, homography, foot_anchors, click_foot_offsets
     )
+    auto_ground = False
     if homography is not None:
         apply_stage_rescue(frames)
+    elif settings.auto_ground_calibration and foot_anchors is not None:
+        model = fit_ground_model(box_samples, (video_meta.width, video_meta.height))
+        if model is not None:
+            apply_ground_model(frames, model)
+            auto_ground = True
 
     dancers_per_frame_total = sum(len(f.dancers) for f in frames)
     max_dancers_in_frame = max((len(f.dancers) for f in frames), default=0)
@@ -388,7 +418,7 @@ def process_video_with_cotracker(
 
     progress_callback(video_meta.frame_count, max(video_meta.frame_count, 1))
 
-    calibrated = homography is not None
+    calibrated = homography is not None or auto_ground
     formations = finalize_frames(
         frames,
         fps=video_meta.fps,
@@ -404,7 +434,9 @@ def process_video_with_cotracker(
     total_frames = len(frames)
     coord_note = (
         "perspective-corrected top-down floor coords from user-marked stage corners"
-        if calibrated
+        if homography is not None
+        else "top-down floor coords auto-calibrated from the dancers' apparent heights"
+        if auto_ground
         else (
             "auto-fit top-down proxy: y axis stretched to the observed anchor band "
             "(10th-90th percentile); not floor-plane calibrated"

@@ -288,3 +288,40 @@ def test_cotracker_frames_before_key_frame_are_invisible(tmp_path):
     assert not any(p.visible for p in pts[:10])
     assert all(p.visible for p in pts[10:])
     assert abs(pts[20].x - 101) <= 1 and abs(pts[20].y - 203) <= 1
+
+
+def test_auto_ground_recovers_floor_without_corners():
+    """Person boxes alone (with some crouches) give a floor map whose width
+    and depth share one scale, i.e. true proportions."""
+    import random
+
+    from app.pipeline.auto_ground import fit_ground_model
+
+    w, h, f = 1280, 720, 0.8 * 1280
+    cam = np.array([0.0, 2.0, -7.0])
+    c, s = math.cos(math.radians(7)), math.sin(math.radians(7))
+    rot = np.array([[1, 0, 0], [0, c, s], [0, -s, c]])
+
+    def proj(p):
+        q = rot @ (p - cam)
+        return w / 2 + f * q[0] / q[2], h / 2 - f * q[1] / q[2]
+
+    rng = random.Random(0)
+    samples, truth = [], []
+    for _ in range(200):
+        x, z = rng.uniform(-4, 4), rng.uniform(0, 6)
+        fu, fv = proj(np.array([x, 0.0, z]))
+        _, hv = proj(np.array([x, 1.65, z]))
+        bh = (fv - hv) * (0.6 if rng.random() < 0.15 else 1.0)
+        samples.append((fv, bh))
+        truth.append((x, z, fu, fv))
+    model = fit_ground_model(samples, (w, h))
+    assert model is not None and model.fitted_horizon
+    assert abs(model.horizon_v - (h / 2 - f * math.tan(math.radians(7)))) < 6
+    hom = model.to_homography()
+    est = np.array([project_to_stage(hom, (fu, fv)) for _, _, fu, fv in truth])
+    tx = np.array([t[0] for t in truth])
+    tz = np.array([t[1] for t in truth])
+    sx = np.polyfit(tx, est[:, 0], 1)[0]
+    sz = np.polyfit(tz, est[:, 1], 1)[0]
+    assert abs(sx / sz - 1.0) < 0.03

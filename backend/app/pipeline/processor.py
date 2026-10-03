@@ -536,6 +536,8 @@ def _split_by_position_change(
 _STAGE_CANVAS_W = 800.0
 _STAGE_CANVAS_H = 450.0
 _MOVEMENT_WINDOW_SEC = 0.17  # half-width of the displacement window
+_NOISE_FLOOR_MARGIN = 1.8
+_MAX_THRESHOLD_FRACTION_OF_P90 = 0.4
 
 
 def _segment_formations(
@@ -593,6 +595,17 @@ def _segment_formations(
             f"max={finite[-1]:.1f}"
         )
 
+    # Adapt to this clip's noise floor: the quietest stretches are holds, so
+    # their speed is pure jitter (tracking noise, grooving in place). The
+    # threshold rises to clear it by a margin, capped well below real moves.
+    # A fixed threshold flickered on/off and chopped holds into pieces when a
+    # clip's jitter sat near it (e.g. a stage zoomed in on the dancers).
+    finite_sorted = sorted(v for v in smoothed if v != float("inf"))
+    if len(finite_sorted) >= 20:
+        p20 = finite_sorted[int(0.2 * len(finite_sorted))]
+        p90 = finite_sorted[int(0.9 * len(finite_sorted))]
+        adaptive = min(_NOISE_FLOOR_MARGIN * p20, _MAX_THRESHOLD_FRACTION_OF_P90 * p90)
+        movement_threshold = max(movement_threshold, adaptive)
     below = sum(1 for v in smoothed if v < movement_threshold)
     logger.info("formation movement raw      (stage px/s): %s", _stats(raw_movement))
     logger.info(

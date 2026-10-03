@@ -1027,7 +1027,9 @@ function ClickPicker({
             back corners where the <strong>wall meets the floor behind them</strong>{' '}
             (not in front of their feet), and the two front corners at the bottom of
             the frame. Click order doesn't matter — we sort automatically. This turns
-            the angled camera view into a true top-down view.
+            the angled camera view into a true top-down view.{' '}
+            <strong>Can't see all four floor corners?</strong> Skip this step — the
+            top-down view is then calibrated automatically from the dancers' heights.
           </span>
         </div>
       ) : (
@@ -1174,7 +1176,7 @@ function ClickPicker({
               setMode('dancers');
             }}
           >
-            Skip — use camera view (formations may look angled)
+            Skip — corners not visible (auto-calibrate from the dancers)
           </button>
         </div>
       ) : (

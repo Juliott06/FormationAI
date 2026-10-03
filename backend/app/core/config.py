@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # box under each click) per dancer and take the median, so one point
     # drifting onto a neighbour is outvoted. Costs ~CoTracker time per point.
     cotracker_auto_points: bool = True
+    # Without 4 marked floor corners, build the top-down view from the
+    # dancers' apparent heights (see pipeline/auto_ground.py) instead of the
+    # raw camera view.
+    auto_ground_calibration: bool = True
 
     model_config = SettingsConfigDict(
         env_prefix="FORMATIONAI_",
