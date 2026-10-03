@@ -126,11 +126,16 @@ class _Dancer:
 
 @dataclass
 class IdentityResult:
+    """feet / tracks / box_samples are in REFERENCE (key-frame) camera
+    coordinates when camera motion was compensated, else raw image coords."""
+
     feet: dict[str, list[Point | None]]
     tracks: list[list[TrackedPoint]]
     box_samples: list[tuple[float, float]]
     reassigned_frames: int
     defected_points: int
+    camera_moving: bool = False
+    feet_image: dict[str, list[Point | None]] | None = None  # raw image coords, for overlays
 
 
 def assign_detections(
@@ -184,8 +189,11 @@ def run_identity_tracking(
     *,
     detector: _Detector,
     detect_every: int = 1,
+    compensate_camera: bool = True,
 ) -> IdentityResult:
     import cv2
+
+    from app.pipeline.camera_motion import CameraMotionEstimator, apply_h, camera_is_moving
 
     n_frames = max((len(t) for t in tracks), default=0)
     names = list(dict.fromkeys(point_names))
@@ -193,8 +201,10 @@ def run_identity_tracking(
     defect_run = [0] * len(tracks)
     defect_at: list[int | None] = [None] * len(tracks)
     feet: dict[str, list[Point | None]] = {n: [None] * n_frames for n in names}
-    box_samples: list[tuple[float, float]] = []
+    # (frame, centre_x, top_y, bottom_y) of unoccluded matched boxes
+    raw_samples: list[tuple[int, float, float, float]] = []
     reassigned = 0
+    estimator = None
 
     dancers: list[_Dancer] = []
     for n in names:
@@ -215,6 +225,11 @@ def run_identity_tracking(
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError(f"Unable to open video file: {video_path}")
+    if compensate_camera:
+        estimator = CameraMotionEstimator(
+            (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        )
+    last_boxes: list[Box] = []
     try:
         for fi in range(n_frames):
             if fi < key_frame:
@@ -222,11 +237,12 @@ def run_identity_tracking(
                     break
                 continue
             process = (fi - key_frame) % max(detect_every, 1) == 0
-            if process:
-                ok, frame = cap.read()
+            if process or estimator is not None:
+                ok, raw_frame = cap.read()
+                frame = raw_frame if process else None
             else:
                 ok = cap.grab()
-                frame = None
+                raw_frame = frame = None
             if not ok:
                 break
 
@@ -251,6 +267,7 @@ def run_identity_tracking(
             boxes: list[Box] = []
             if frame is not None:
                 boxes = [det.bbox for det in detector.detect(frame)]
+                last_boxes = boxes
                 feats = [appearance_feature(frame, b) for b in boxes]
                 ready = [d for d in dancers if d.template_key is not None]
                 ready_idx = [di for di, d in enumerate(dancers) if d.template_key is not None]
@@ -277,6 +294,9 @@ def run_identity_tracking(
                                 defect_at[i] = fi - _DEFECT_FRAMES + 1
                         elif in_own:
                             defect_run[i] = 0
+
+            if estimator is not None:
+                estimator.add_frame(raw_frame, last_boxes)
 
             for di, d in enumerate(dancers):
                 trusted_pts = [
@@ -306,7 +326,7 @@ def run_identity_tracking(
                         if bj != assignment[di]
                     )
                     if clean:
-                        box_samples.append((fy, float(h)))
+                        raw_samples.append((fi, x + w / 2.0, float(y), fy))
                         feat = appearance_feature(frame, (x, y, w, h))
                         d.template = (1 - _TEMPLATE_RATE) * d.template + _TEMPLATE_RATE * feat
                     feet[d.name][fi] = (int(round(fx)), int(round(fy)))
@@ -334,19 +354,50 @@ def run_identity_tracking(
     finally:
         cap.release()
 
+    # Camera motion: express everything in the key frame's view so the floor
+    # mapping (solved in that view) stays valid while the camera pans/zooms.
+    mats = estimator.to_reference(0) if estimator is not None else []
+    moving = bool(mats) and camera_is_moving(
+        mats, (int(estimator.size[0] / estimator.scale), int(estimator.size[1] / estimator.scale))
+    )
+
+    def to_ref(fi: int, x: float, y: float) -> tuple[float, float]:
+        k = fi - key_frame
+        if not moving or k < 0 or k >= len(mats):
+            return x, y
+        return apply_h(mats[k], x, y)
+
+    feet_image = {name: list(series) for name, series in feet.items()}
+    if moving:
+        for name, series in feet.items():
+            feet[name] = [
+                None if p is None else tuple(int(round(v)) for v in to_ref(fi, p[0], p[1]))  # type: ignore[misc]
+                for fi, p in enumerate(series)
+            ]
+    box_samples: list[tuple[float, float]] = []
+    for fi, cx, top, bottom in raw_samples:
+        _, ty = to_ref(fi, cx, top)
+        _, by = to_ref(fi, cx, bottom)
+        box_samples.append((by, by - ty))
+
     cleaned: list[list[TrackedPoint]] = []
     for i, tr in enumerate(tracks):
         cut = defect_at[i]
-        if cut is None:
-            cleaned.append(tr)
-        else:
-            cleaned.append(
-                [p if p.frame < cut else TrackedPoint(p.frame, p.x, p.y, False) for p in tr]
-            )
+        out_tr = []
+        for p in tr:
+            x, y = (p.x, p.y)
+            if moving:
+                rx, ry = to_ref(p.frame, p.x, p.y)
+                x, y = int(round(rx)), int(round(ry))
+            visible = p.visible and (cut is None or p.frame < cut)
+            out_tr.append(p if (x, y, visible) == (p.x, p.y, p.visible) else TrackedPoint(p.frame, x, y, visible))
+        cleaned.append(out_tr)
     defected = sum(1 for t in trusted if not t)
+    if moving:
+        logger.info("identity: camera pans/zooms — positions compensated to the key-frame view")
     logger.info(
         "identity: %d dancers, %d points defected (ignored after latching onto "
         "someone else), %d re-acquisitions after occlusion, %d clean box samples",
         len(dancers), defected, reassigned, len(box_samples),
     )
-    return IdentityResult(feet, cleaned, box_samples, reassigned, defected)
+    return IdentityResult(feet, cleaned, box_samples, reassigned, defected, moving, feet_image)

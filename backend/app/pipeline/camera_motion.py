@@ -6,7 +6,8 @@ move — a zoom-in looks like everyone walking toward the camera. Practice
 videos often reframe like this.
 
 A camera that pans/tilts/zooms about a fixed position relates any two frames
-by a homography, so we estimate frame-to-frame homographies from the
+by a homography — between consecutive frames, nearly a similarity (shift +
+zoom + slight roll), which is what we fit, robustly, from the
 BACKGROUND (walls, floor markings) with sparse optical flow, masking out the
 people, and chain them into M_t: frame t pixels -> reference (key) frame
 pixels. Positions are converted with M_t before floor projection.
@@ -25,6 +26,10 @@ logger = logging.getLogger("uvicorn.error")
 _WORK_WIDTH = 640
 _STILL_PX = 0.35  # median background flow below this = camera didn't move
 _MIN_POINTS = 25
+# Most background points must agree on the camera motion. Moving dancers that
+# slip past the person mask disagree with each other, so they can't reach
+# this together — which is what stops a fixed camera from "drifting".
+_MIN_INLIER_FRACTION = 0.6
 
 Matrix = list[list[float]]
 Box = tuple[int, int, int, int]
@@ -92,12 +97,28 @@ class CameraMotionEstimator:
             if len(p0) >= _MIN_POINTS:
                 flow = np.median(np.linalg.norm(p1 - p0, axis=1))
                 if flow * (1 / self.scale) >= _STILL_PX:
-                    hm, inl = cv2.findHomography(p1, p0, cv2.RANSAC, 1.5)
-                    if hm is not None and inl is not None and inl.sum() >= _MIN_POINTS:
-                        s = np.diag([self.scale, self.scale, 1.0])
-                        step = np.linalg.inv(s) @ hm @ s
-                        step /= step[2, 2]
-                        self.moving_steps += 1
+                    # Pan / tilt / zoom (+ slight roll) between consecutive
+                    # frames is a similarity transform to good approximation;
+                    # a full homography overfits to whatever moving people
+                    # slip past the mask.
+                    sim, inl = cv2.estimateAffinePartial2D(
+                        p1, p0, method=cv2.RANSAC, ransacReprojThreshold=1.0
+                    )
+                    if sim is not None and inl is not None:
+                        n_in = int(inl.sum())
+                        zoom = float(np.hypot(sim[0, 0], sim[1, 0]))
+                        shift = float(np.hypot(sim[0, 2], sim[1, 2]))
+                        plausible = (
+                            n_in >= _MIN_POINTS
+                            and n_in >= _MIN_INLIER_FRACTION * len(p0)
+                            and abs(zoom - 1.0) < 0.08
+                            and shift < 0.08 * self.size[0]
+                        )
+                        if plausible:
+                            hm = np.vstack([sim, [0.0, 0.0, 1.0]])
+                            s_ = np.diag([self.scale, self.scale, 1.0])
+                            step = np.linalg.inv(s_) @ hm @ s_
+                            self.moving_steps += 1
         self.steps.append(step)
         self.prev_gray = gray
 
