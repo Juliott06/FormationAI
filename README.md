@@ -47,6 +47,25 @@ for the full tuning history that led here.
    is calibrated automatically from the dancers' apparent heights.
 5. Click **Start processing**. The tracker runs, then the stage view renders.
 
+What happens under the hood:
+
+- **Identity correction.** CoTracker follows pixels, so a dancer hidden behind
+  someone can have her points latch onto the person in front. A person detector
+  runs on every frame and each detection is matched to a dancer using motion,
+  appearance (OSNet person re-identification) and the tracked points; points
+  that stick to another dancer are ignored from then on.
+- **Camera motion.** If the camera pans or zooms, the background is tracked and
+  all positions are converted back to the click frame's view, so a zoom doesn't
+  look like everyone walking forward.
+- **Floor mapping without corners.** Dancers' apparent heights give the horizon
+  and camera height, which yields a true top-down view.
+
+**Fixing a swap.** If two dancers still get mixed up (look-alike outfits
+crossing), use **Fix identities from this frame & re-run** on the result page
+(or, before processing, scrub to a later frame): click a dancer on that frame
+and pick who she is. That *anchor* pins her identity from that moment on. A
+dancer who only enters later can also be added this way.
+
 After processing you can still hand-correct: merge two IDs that are the same
 dancer, swap IDs at a crossing, rename dancers, and compare against a reference
 video.

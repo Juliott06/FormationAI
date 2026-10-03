@@ -706,3 +706,21 @@ header p {
   pointer-events: none;
   z-index: 2;
 }
+
+.click-frame-link {
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  padding: 0;
+}
+
+.click-row select {
+  flex: 1;
+  min-width: 0;
+  background: #1a1f26;
+  color: inherit;
+  border: 1px solid #2a3038;
+  border-radius: 4px;
+  padding: 0.35rem 0.5rem;
+}

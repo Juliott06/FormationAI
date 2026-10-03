@@ -4,6 +4,9 @@ export interface DancerClick {
   name: string;
   x: number;
   y: number;
+  /** Frame the click was made on. A click on a frame after the seed frame
+   *  is an identity anchor: it pins that dancer to the clicked person there. */
+  frame?: number;
 }
 
 export interface ClickSeedRequest {

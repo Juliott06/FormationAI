@@ -244,28 +244,31 @@ export default function App() {
   }
 
   function handleAddClick(c: DancerClick) {
-    // Clicks are only valid on the frame they were made on. First click pins
-    // the seed frame; clicking on a different frame restarts the click set
-    // there (coords from one frame + key_frame from another would seed the
-    // trackers on the wrong dancers).
-    if (seedFrame === null || clicks.length === 0) {
+    // The first click pins the seed frame (tracking runs forward from it).
+    // Clicks on LATER frames are identity anchors for already-named dancers —
+    // use them to fix a swap after a crossing. Clicking an EARLIER frame
+    // restarts the set there, since nothing before the seed is tracked.
+    const withFrame = { ...c, frame: clickFrame };
+    if (seedFrame === null || clicks.length === 0 || clickFrame < seedFrame) {
       setSeedFrame(clickFrame);
-      setClicks([c]);
-      return;
-    }
-    if (clickFrame !== seedFrame) {
-      setSeedFrame(clickFrame);
-      setClicks([c]);
+      setClicks([withFrame]);
       setError(null);
       return;
     }
-    setClicks((prev) => [...prev, c]);
+    setClicks((prev) => [...prev, withFrame]);
   }
 
   async function handleSubmitClicks() {
     if (!jobId) return;
+    const seed = seedFrame ?? clickFrame;
     const cleaned = clicks
-      .map((c) => ({ name: c.name.trim(), x: c.x, y: c.y }))
+      .map((c) => ({
+        name: c.name.trim(),
+        x: c.x,
+        y: c.y,
+        // Seed-frame clicks omit frame; later-frame clicks are anchors.
+        ...(c.frame !== undefined && c.frame !== seed ? { frame: c.frame } : {}),
+      }))
       .filter((c) => c.name);
     if (cleaned.length === 0) {
       setError('Click on each dancer and give them a name first.');
@@ -282,7 +285,7 @@ export default function App() {
         // key_frame is the frame the clicks were MADE on, not the scrubber's
         // current position. stage_corners only sent when all 4 are marked.
         body: JSON.stringify({
-          key_frame: seedFrame ?? clickFrame,
+          key_frame: seed,
           clicks: cleaned,
           stage_corners: stageCorners.length === 4 ? stageCorners : undefined,
         }),
@@ -530,6 +533,20 @@ export default function App() {
               {positions.summary.unique_track_ids} · Max dancers per frame:{' '}
               {positions.summary.max_dancers_in_frame}
             </span>
+            {jobId && clicks.length > 0 && (
+              <button
+                type="button"
+                className="click-secondary"
+                title="Go back to the click screen on this frame to add anchor clicks, then re-run"
+                onClick={() => {
+                  setClickFrame(currentFrame.frame);
+                  setSelectedIds([]);
+                  setPhase('awaiting_clicks');
+                }}
+              >
+                Fix identities from this frame &amp; re-run
+              </button>
+            )}
             {jobId && status?.debug_video_available && (
               <a
                 href={`${API_BASE}/jobs/${jobId}/debug-video`}
@@ -928,8 +945,9 @@ function ClickPicker({
 }) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   // Two phases: first mark the floor corners, then click the dancers.
-  const [mode, setMode] = useState<PickMode>('corners');
-  const [cornersDone, setCornersDone] = useState(false);
+  // Coming back from a finished job to add anchors: skip straight to dancers.
+  const [mode, setMode] = useState<PickMode>(clicks.length > 0 ? 'dancers' : 'corners');
+  const [cornersDone, setCornersDone] = useState(clicks.length > 0);
   // The slider updates a local value on every tick; the actual frame (which
   // triggers a backend video-decode per change) commits after a short pause,
   // so dragging doesn't fire hundreds of frame-extraction requests.
@@ -948,14 +966,20 @@ function ClickPicker({
   );
 
   // Stable per-dancer-name ordering and color
+  const isAnchor = (c: DancerClick) =>
+    seedFrame !== null && c.frame !== undefined && c.frame !== seedFrame;
   const nameOrder = useMemo(() => {
     const seen: string[] = [];
     for (const c of clicks) {
+      if (isAnchor(c)) continue;
       const n = c.name.trim();
       if (n && !seen.includes(n)) seen.push(n);
     }
     return seen;
-  }, [clicks]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clicks, seedFrame]);
+  const anchorCount = clicks.filter(isAnchor).length;
+  const onSeedFrame = seedFrame === null || frame === seedFrame;
 
   function colorForName(name: string): string {
     const idx = nameOrder.indexOf(name.trim());
@@ -966,7 +990,7 @@ function ClickPicker({
     const target = clicks[clickIdx].name.trim();
     let n = 0;
     for (let i = 0; i <= clickIdx; i++) {
-      if (clicks[i].name.trim() === target) n++;
+      if (clicks[i].name.trim() === target && !isAnchor(clicks[i])) n++;
     }
     return n;
   }
@@ -996,7 +1020,7 @@ function ClickPicker({
       if (stageCorners.length < 4) onAddCorner(pt);
       return;
     }
-    if (event.shiftKey) {
+    if (event.shiftKey && onSeedFrame) {
       const target = lastNamedClick();
       if (target) {
         onAddClick({ name: target.name, x: pt[0], y: pt[1] });
@@ -1039,9 +1063,19 @@ function ClickPicker({
             Tracking runs from the clicked frame <strong>forward</strong> — pick a frame
             near the start where every dancer is visible. <strong>Shift+Click</strong>{' '}
             adds a second point on the most-recently-named dancer (e.g. head + torso) —
-            useful when they get occluded. All dancer clicks must be on the same frame;
-            clicking a different frame restarts the set there.
+            useful when they get occluded.
           </span>
+          <span>
+            <strong>Fixing swaps:</strong> scrub to a <strong>later</strong> frame where two
+            dancers got mixed up (e.g. right after they cross), click a dancer there and pick
+            who it is from the list. That <em>anchor</em> pins her identity from that moment.
+            Clicking an earlier frame than the seed restarts the click set.
+          </span>
+          {!onSeedFrame && (
+            <span className="seed-frame-note">
+              <strong>Anchor mode</strong> — clicks on this frame (f{frame}) fix identities.
+            </span>
+          )}
           {seedFrame !== null && (
             <span className="seed-frame-note">
               Seeding on frame {seedFrame}
@@ -1113,10 +1147,13 @@ function ClickPicker({
         {/* Dancer markers (only in dancer mode) */}
         {mode === 'dancers' &&
           clicks.map((c, i) => {
+            if ((c.frame ?? seedFrame) !== frame) return null;
             const [left, top] = toPct(c.x, c.y);
             const name = c.name.trim();
             const ptIdx = name ? pointIndexForClick(i) : 0;
-            const label = name ? (ptIdx > 1 ? `${name}·${ptIdx}` : name) : `#${i + 1}`;
+            const label = isAnchor(c)
+              ? `⚑ ${name || '?'}`
+              : name ? (ptIdx > 1 ? `${name}·${ptIdx}` : name) : `#${i + 1}`;
             return (
               <div
                 key={i}
@@ -1190,7 +1227,9 @@ function ClickPicker({
             {clicks.map((c, i) => {
               const name = c.name.trim();
               const ptIdx = name ? pointIndexForClick(i) : 0;
-              const chipText = name ? (ptIdx > 1 ? `${name}·${ptIdx}` : name) : `#${i + 1}`;
+              const chipText = isAnchor(c)
+                ? `⚑`
+                : name ? (ptIdx > 1 ? `${name}·${ptIdx}` : name) : `#${i + 1}`;
               return (
                 <div key={i} className="click-row">
                   <span
@@ -1199,16 +1238,36 @@ function ClickPicker({
                   >
                     {chipText}
                   </span>
-                  <input
-                    type="text"
-                    placeholder="dancer name (e.g. Yeji)"
-                    value={c.name}
-                    onChange={(e) => onUpdateClick(i, { name: e.target.value })}
-                    disabled={submitting}
-                  />
-                  <span className="click-coords">
-                    ({c.x}, {c.y})
-                  </span>
+                  {isAnchor(c) ? (
+                    <select
+                      value={c.name}
+                      onChange={(e) => onUpdateClick(i, { name: e.target.value })}
+                      disabled={submitting}
+                    >
+                      <option value="">which dancer is this?</option>
+                      {nameOrder.map((n) => (
+                        <option key={n} value={n}>
+                          {n}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type="text"
+                      placeholder="dancer name (e.g. Yeji)"
+                      value={c.name}
+                      onChange={(e) => onUpdateClick(i, { name: e.target.value })}
+                      disabled={submitting}
+                    />
+                  )}
+                  <button
+                    type="button"
+                    className="click-coords click-frame-link"
+                    onClick={() => onFrameChange(c.frame ?? seedFrame ?? 0)}
+                    title="Show this frame"
+                  >
+                    {isAnchor(c) ? `anchor @ f${c.frame}` : `(${c.x}, ${c.y})`}
+                  </button>
                   <button
                     type="button"
                     className="click-remove"
@@ -1232,7 +1291,7 @@ function ClickPicker({
             >
               {submitting
                 ? 'Processing…'
-                : `Start processing (${nameOrder.length} dancer${nameOrder.length === 1 ? '' : 's'}, ${clicks.length} point${clicks.length === 1 ? '' : 's'})`}
+                : `Start processing (${nameOrder.length} dancer${nameOrder.length === 1 ? '' : 's'}, ${clicks.length - anchorCount} point${clicks.length - anchorCount === 1 ? '' : 's'}${anchorCount ? `, ${anchorCount} anchor${anchorCount === 1 ? '' : 's'}` : ''})`}
             </button>
             <button
               type="button"
