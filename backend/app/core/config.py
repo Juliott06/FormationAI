@@ -26,7 +26,14 @@ class Settings(BaseSettings):
     yolo_max_detections: int = 20
     yolo_device: str = "cpu"
     tracker_config: str = "botsort_reid.yaml"
+    # Deprecated (image px/frame); segmentation now uses
+    # formation_movement_threshold. Kept so old .env files still load.
     formation_movement_threshold_px: float = 15.0
+    # Average dancer speed on the 800x450 stage canvas, px/second, below which
+    # the dancers count as holding a formation. ~25 px/s ≈ 0.4 m/s on a
+    # typical floor: slower than walking to a new spot, faster than grooving
+    # in place.
+    formation_movement_threshold: float = 25.0
     formation_smoothing_window: int = 9
     formation_min_duration_sec: float = 0.5
     formation_split_window_frames: int = 10
@@ -34,6 +41,10 @@ class Settings(BaseSettings):
     formation_snap_grid_step: float = 0.05
     formation_dedup_distance: float = 0.03
     formation_template_snap_threshold: float = 0.08
+    # Fit error relative to the formation's own size (RMS radius). 0.25 means
+    # dancers sit on average within a quarter of the formation's radius of
+    # the ideal shape.
+    formation_template_snap_relative_threshold: float = 0.25
     interpolation_max_gap_frames: int = 60
     auto_swap_jump_threshold: float = 0.08
     auto_swap_advantage_ratio: float = 2.5
@@ -58,6 +69,10 @@ class Settings(BaseSettings):
     # near the camera horizon and carry almost no depth signal.
     cotracker_foot_assist: bool = True
     foot_assist_sample_every: int = 3
+    # Auto support points: track 2 extra points (chest + hips, from the person
+    # box under each click) per dancer and take the median, so one point
+    # drifting onto a neighbour is outvoted. Costs ~CoTracker time per point.
+    cotracker_auto_points: bool = True
 
     model_config = SettingsConfigDict(
         env_prefix="FORMATIONAI_",

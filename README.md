@@ -124,11 +124,13 @@ YOLO.
 **Tuning:**
 
 ```
-FORMATIONAI_COTRACKER_RESIZE_WIDTH=960     # lower = faster, less accurate on distant dancers
+FORMATIONAI_COTRACKER_RESIZE_WIDTH=960     # CoTracker runs at 512x384 internally; above ~512 only costs decode time
+FORMATIONAI_COTRACKER_AUTO_POINTS=true     # 2 extra tracked points per dancer, median-voted (robust to drift)
 FORMATIONAI_YOLO_IMAGE_SIZE=1280           # YOLO detection resolution
 FORMATIONAI_YOLO_CONFIDENCE_THRESHOLD=0.20 # lower = more detections (+ more false positives)
 FORMATIONAI_TRACKER_CONFIG=botsort_reid.yaml
 FORMATIONAI_FORMATION_TEMPLATE_SNAP_THRESHOLD=0.08  # how aggressively to snap to clean shapes
+FORMATIONAI_FORMATION_MOVEMENT_THRESHOLD=25         # stage px/s below which dancers are "holding" a formation
 ```
 
 The file has inline comments explaining every knob and why it's set where it is.
@@ -151,6 +153,17 @@ rates line up correctly.
 ```powershell
 ..\.venv\Scripts\python.exe -m pytest tests/backend/ -q      # from repo root
 cd frontend && npx tsc --noEmit                              # frontend type check
+```
+
+`backend/scripts/synthetic_check.py` is an end-to-end check that needs no model
+weights: it renders a synthetic practice-room clip with known formations, runs
+the real CoTracker pipeline with simulated CoTracker/YOLO (including occlusion,
+drift and merged-box failures), and reports position error vs ground truth,
+floor proportions and detected formations:
+
+```powershell
+cd backend
+..\.venv\Scripts\python.exe -m scripts.synthetic_check --out ..\synthetic_out
 ```
 
 ---

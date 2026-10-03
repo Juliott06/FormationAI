@@ -134,7 +134,10 @@ export default function App() {
     if (!response.ok) throw new Error(`Positions request failed (${response.status})`);
     const data = (await response.json()) as PositionsResult;
     setPositions(data);
-    setFrameIndex(0);
+    // Tracking starts at the clicked key frame; open the stage view on the
+    // first frame that actually has dancers instead of an empty stage.
+    const firstPopulated = data.frames.findIndex((f) => f.dancers.length > 0);
+    setFrameIndex(Math.max(firstPopulated, 0));
     try {
       const labelResp = await fetch(`${API_BASE}/jobs/${id}/labels`);
       if (labelResp.ok) {
@@ -853,6 +856,16 @@ function Metric({
 
 type PickMode = 'corners' | 'dancers';
 
+// Corners can be clicked in any order; draw them as a non-self-intersecting
+// quad (back-left, back-right, front-right, front-left) like the backend does.
+function sortedQuad(corners: [number, number][]): [number, number][] {
+  if (corners.length !== 4) return corners;
+  const byY = [...corners].sort((a, b) => a[1] - b[1]);
+  const back = byY.slice(0, 2).sort((a, b) => a[0] - b[0]);
+  const front = byY.slice(2).sort((a, b) => a[0] - b[0]);
+  return [back[0], back[1], front[1], front[0]];
+}
+
 function pointInQuad(px: number, py: number, quad: [number, number][]): boolean {
   // Standard ray-cast: count edge crossings of a horizontal ray from (px,py).
   let inside = false;
@@ -864,6 +877,22 @@ function pointInQuad(px: number, py: number, quad: [number, number][]): boolean 
     }
   }
   return inside;
+}
+
+// Clicks are on torsos/heads, which sit ABOVE the floor quad in the image, so
+// testing the click itself flagged every dancer as "outside the floor". The
+// dancer's feet are somewhere straight below the click: warn only if no point
+// on that vertical line is inside the quad.
+function floorBelowClick(
+  x: number,
+  y: number,
+  quad: [number, number][],
+  frameHeight: number,
+): boolean {
+  for (let yy = y; yy < frameHeight; yy += 4) {
+    if (pointInQuad(x, yy, quad)) return true;
+  }
+  return false;
 }
 
 function ClickPicker({
@@ -977,9 +1006,15 @@ function ClickPicker({
     onAddClick({ name: '', x: pt[0], y: pt[1] });
   }
 
-  const rect = imgRef.current?.getBoundingClientRect();
-  const toCss = (x: number, y: number): [number, number] =>
-    rect ? [(x / videoMeta.width) * rect.width, (y / videoMeta.height) * rect.height] : [0, 0];
+  // Overlays are positioned in video-pixel space via an SVG viewBox and
+  // percentage offsets, so they track the image at any size. (They used to
+  // read the image's on-screen rect during render — undefined before the
+  // first image load and stale after a resize, so markers drew in the wrong
+  // place or not at all.)
+  const toPct = (x: number, y: number): [string, string] => [
+    `${(x / videoMeta.width) * 100}%`,
+    `${(y / videoMeta.height) * 100}%`,
+  ];
 
   return (
     <section className="click-picker">
@@ -1018,7 +1053,7 @@ function ClickPicker({
             </span>
           )}
           {stageCorners.length === 4 &&
-            clicks.some((c) => !pointInQuad(c.x, c.y, stageCorners)) && (
+            clicks.some((c) => !floorBelowClick(c.x, c.y, stageCorners, videoMeta.height)) && (
               <span className="seed-frame-note">
                 <strong>
                   ⚠ Some dancers are outside your marked floor — the view will be
@@ -1040,39 +1075,43 @@ function ClickPicker({
           style={{ cursor: 'crosshair' }}
         />
         {/* Floor quad overlay */}
-        {rect && stageCorners.length > 0 && (
+        {stageCorners.length >= 2 && (
           <svg
             className="corner-overlay"
-            width={rect.width}
-            height={rect.height}
-            style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none' }}
+            viewBox={`0 0 ${videoMeta.width} ${videoMeta.height}`}
+            preserveAspectRatio="none"
+            style={{
+              position: 'absolute',
+              left: 0,
+              top: 0,
+              width: '100%',
+              height: '100%',
+              pointerEvents: 'none',
+            }}
           >
-            {stageCorners.length >= 2 && (
-              <polygon
-                points={stageCorners.map(([x, y]) => toCss(x, y).join(',')).join(' ')}
-                fill="rgba(74,123,255,0.15)"
-                stroke="#4a7bff"
-                strokeWidth={2}
-              />
-            )}
-            {stageCorners.map(([x, y], i) => {
-              const [cx, cy] = toCss(x, y);
-              return (
-                <g key={i}>
-                  <circle cx={cx} cy={cy} r={7} fill="#4a7bff" stroke="#fff" strokeWidth={2} />
-                  <text x={cx} y={cy - 10} fill="#fff" fontSize={11} textAnchor="middle">
-                    {i + 1}
-                  </text>
-                </g>
-              );
-            })}
+            <polygon
+              points={sortedQuad(stageCorners)
+                .map(([x, y]) => `${x},${y}`)
+                .join(' ')}
+              fill="rgba(74,123,255,0.15)"
+              stroke="#4a7bff"
+              strokeWidth={2}
+              vectorEffect="non-scaling-stroke"
+            />
           </svg>
         )}
+        {stageCorners.map(([x, y], i) => {
+          const [left, top] = toPct(x, y);
+          return (
+            <div key={`corner-${i}`} className="corner-marker" style={{ left, top }}>
+              {i + 1}
+            </div>
+          );
+        })}
         {/* Dancer markers (only in dancer mode) */}
-        {rect &&
-          mode === 'dancers' &&
+        {mode === 'dancers' &&
           clicks.map((c, i) => {
-            const [sx, sy] = toCss(c.x, c.y);
+            const [left, top] = toPct(c.x, c.y);
             const name = c.name.trim();
             const ptIdx = name ? pointIndexForClick(i) : 0;
             const label = name ? (ptIdx > 1 ? `${name}·${ptIdx}` : name) : `#${i + 1}`;
@@ -1081,8 +1120,8 @@ function ClickPicker({
                 key={i}
                 className="click-marker"
                 style={{
-                  left: `${sx}px`,
-                  top: `${sy}px`,
+                  left,
+                  top,
                   background: name ? colorForName(name) : colorForTrack(clicks.length + i + 1),
                 }}
                 title={label}

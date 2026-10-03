@@ -5,11 +5,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.pipeline.processor import apply_id_merge, apply_id_swap, apply_labels, inspect_video_file
+from app.pipeline.video_io import normalize_frame_rate
 from app.pipeline.stage_renderer import (
     concat_side_by_side,
     ensure_web_playable,
@@ -209,6 +211,8 @@ async def upload_video(
     job_id = str(uuid4())
     temp_path = settings.jobs_dir / f"{job_id}{suffix}"
     temp_path.write_bytes(payload)
+    if await run_in_threadpool(normalize_frame_rate, temp_path):
+        payload = temp_path.read_bytes()
     try:
         inspected = inspect_video_file(temp_path)
     except Exception as exc:

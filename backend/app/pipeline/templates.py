@@ -39,28 +39,32 @@ def generate_templates_for_count(n: int) -> list[FormationTemplate]:
     if rows >= 2 and cols >= 2:
         grid_pts = []
         for r in range(rows):
-            for c in range(cols):
-                if len(grid_pts) >= n:
-                    break
-                x = (c / max(cols - 1, 1)) * 2 - 1 if cols > 1 else 0.0
-                y = (r / max(rows - 1, 1)) * 2 - 1 if rows > 1 else 0.0
+            in_row = min(cols, n - r * cols)
+            # A partial last row is centred, not left-aligned.
+            offset = (cols - in_row) / 2.0
+            for c in range(in_row):
+                x = ((c + offset) / max(cols - 1, 1)) * 2 - 1
+                y = (r / max(rows - 1, 1)) * 2 - 1
                 grid_pts.append([x, y])
         templates.append(
             FormationTemplate(f"{rows}x{cols} grid", np.array(grid_pts))
         )
 
-    # V shape (point at the front)
-    arm_n = (n + 1) // 2
-    other_n = n - arm_n
-    left_arm = [
-        [-i / max(arm_n - 1, 1), -(arm_n - 1 - i) / max(arm_n - 1, 1)]
-        for i in range(arm_n)
-    ]
-    right_arm = [
-        [i / max(other_n, 1), -(other_n - i) / max(other_n, 1)]
-        for i in range(1, other_n + 1)
-    ]
-    v_pts = np.array(left_arm + right_arm)
+    # V shape (point at the front). Symmetric: odd counts put one dancer at
+    # the apex, even counts a pair; the rest pair up outward/backward.
+    pairs = n // 2
+    has_apex = n % 2 == 1
+    levels = pairs + (1 if has_apex else 0)
+    v_list: list[list[float]] = []
+    if has_apex:
+        v_list.append([0.0, -1.0])
+    for k in range(pairs):
+        level = k + (1 if has_apex else 0)
+        y = -1.0 + 2.0 * level / max(levels - 1, 1)
+        x = (k + 1) / pairs if has_apex else (k + 0.5) / pairs
+        v_list.append([-x, y])
+        v_list.append([x, y])
+    v_pts = np.array(v_list)
     templates.append(FormationTemplate("V", v_pts))
 
     # Inverted V (point at the back)
@@ -86,74 +90,80 @@ def generate_templates_for_count(n: int) -> list[FormationTemplate]:
             for c_idx in range(row_count):
                 x = (c_idx - (row_count - 1) / 2) / max(max_row - 1, 1) * 2
                 triangle_pts.append([x, y])
-        templates.append(FormationTemplate("Triangle", np.array(triangle_pts)))
+        tri = np.array(triangle_pts)
+        templates.append(FormationTemplate("Triangle", tri))
+        inv_tri = tri.copy()
+        inv_tri[:, 1] *= -1
+        templates.append(FormationTemplate("Inverted triangle", inv_tri))
 
     return templates
 
 
-def _procrustes_fit(
+def _axis_aligned_fit(
     source: np.ndarray, target: np.ndarray
 ) -> tuple[np.ndarray, float]:
-    """Find best rigid-similarity transform (rotation + uniform scale + translation)
-    that maps source onto target. Returns transformed source and RMSE distance."""
-    src_mean = source.mean(axis=0)
+    """Best fit of `source` onto `target` (same order) using translation and a
+    separate NON-NEGATIVE scale per axis — deliberately no rotation.
+
+    Formations are named relative to the audience: a line tilted 30 degrees is
+    not a "Line", and a V rotated 180 degrees is an inverted V. The previous
+    similarity (Procrustes) fit allowed any rotation, so tilted shapes snapped
+    to "Line" and got drawn tilted, and V / Inverted V were interchangeable.
+    Per-axis scale lets a wide shallow V still be a V. Returns the fitted
+    points and RMSE (in target units)."""
+    src_c = source - source.mean(axis=0)
     tgt_mean = target.mean(axis=0)
-    src_c = source - src_mean
     tgt_c = target - tgt_mean
+    fitted = np.empty_like(tgt_c)
+    for axis in range(2):
+        denom = float((src_c[:, axis] ** 2).sum())
+        scale = float((src_c[:, axis] * tgt_c[:, axis]).sum() / denom) if denom > 1e-12 else 0.0
+        fitted[:, axis] = max(scale, 0.0) * src_c[:, axis]
+    fitted += tgt_mean
+    rmse = float(np.sqrt(((fitted - target) ** 2).sum(axis=1).mean()))
+    return fitted, rmse
 
-    H = src_c.T @ tgt_c
-    U, S, Vt = np.linalg.svd(H)
-    R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[-1] *= -1
-        R = Vt.T @ U.T
 
-    src_norm_sq = float((src_c ** 2).sum())
-    scale = float(S.sum() / src_norm_sq) if src_norm_sq > 1e-9 else 1.0
-
-    transformed = scale * src_c @ R.T + tgt_mean
-    rmse = float(np.sqrt(((transformed - target) ** 2).sum(axis=1).mean()))
-    return transformed, rmse
+def formation_spread(observed: np.ndarray) -> float:
+    """RMS distance of the points from their centroid — the formation's size,
+    used to judge fit error relative to how big the formation is."""
+    centered = observed - observed.mean(axis=0)
+    return float(np.sqrt((centered ** 2).sum(axis=1).mean()))
 
 
 def fit_template(
-    template: FormationTemplate, observed: np.ndarray, *, max_iters: int = 4
+    template: FormationTemplate, observed: np.ndarray, *, max_iters: int = 6
 ) -> tuple[np.ndarray, float]:
     """Iteratively fit template points to observed points (same N).
-    Returns (snapped_positions in observed order, RMSE)."""
+    Returns (snapped_positions in observed order, RMSE).
+
+    Alternates optimal assignment (Hungarian) with the axis-aligned fit,
+    starting from the template stretched to the observed bounding box."""
     n = observed.shape[0]
     if template.points.shape[0] != n or n < 2:
         return observed.copy(), float("inf")
 
-    # Initialize: center template on observed and rough-scale to match spread.
     obs_mean = observed.mean(axis=0)
-    obs_spread = float(np.linalg.norm(observed - obs_mean))
+    obs_half_range = (observed.max(axis=0) - observed.min(axis=0)) / 2.0
     tmpl_centered = template.points - template.points.mean(axis=0)
-    tmpl_spread = float(np.linalg.norm(tmpl_centered))
-    if tmpl_spread > 1e-9 and obs_spread > 1e-9:
-        snapped = tmpl_centered * (obs_spread / tmpl_spread) + obs_mean
-    else:
-        snapped = tmpl_centered + obs_mean
+    tmpl_half_range = (tmpl_centered.max(axis=0) - tmpl_centered.min(axis=0)) / 2.0
+    scale = np.where(tmpl_half_range > 1e-9, obs_half_range / np.maximum(tmpl_half_range, 1e-9), 0.0)
+    snapped = tmpl_centered * scale + obs_mean
 
     best_rmse = float("inf")
+    best = snapped
     for _ in range(max_iters):
-        # Assign each observed dancer to the nearest snapped template point.
         diff = observed[:, None, :] - snapped[None, :, :]
         cost = np.sqrt((diff ** 2).sum(axis=2))
         obs_idx, tmpl_idx = linear_sum_assignment(cost)
-
-        # Reorder template points to match observed[i]'s order.
         reorder = np.zeros(n, dtype=int)
         reorder[obs_idx] = tmpl_idx
-        ordered_template = snapped[reorder]
-
-        # Procrustes alignment in observed space.
-        new_snapped, rmse = _procrustes_fit(ordered_template, observed)
-        if rmse + 1e-6 >= best_rmse:
-            snapped = new_snapped
-            best_rmse = rmse
+        ordered_template = tmpl_centered[reorder]
+        new_snapped, rmse = _axis_aligned_fit(ordered_template, observed)
+        if rmse + 1e-9 >= best_rmse:
             break
-        snapped = new_snapped
         best_rmse = rmse
+        best = new_snapped
+        snapped = new_snapped
 
-    return snapped, best_rmse
+    return best, best_rmse

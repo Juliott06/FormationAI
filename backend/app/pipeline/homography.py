@@ -24,6 +24,21 @@ Corner = tuple[float, float]
 # border and look cut off. The margin keeps them visible.
 STAGE_MARGIN = 0.1
 
+# Width / height of the stage canvas every renderer draws (frontend SVG and
+# stage_renderer are both 800x450). Normalized stage x and y are fractions of
+# this canvas, so one unit of x is 16/9 as long on screen as one unit of y.
+CANVAS_ASPECT = 16.0 / 9.0
+# Assumed focal length as a multiple of image width: a phone main camera
+# filming 16:9 (~64° horizontal FOV). Solving it from the floor's vanishing
+# points was tried and rejected: for the usual front-facing camera the floor's
+# front/back edges are near-parallel in the image, so ±3px of click error
+# swung the solved focal length from 0.4W to 1.0W. The aspect estimate scales
+# roughly with 1/f, so a ±12% wrong guess costs ~±15% — versus the old
+# behaviour of always stretching the floor to 16:9 whatever its shape.
+_DEFAULT_FOCAL_WIDTHS = 0.8
+_MIN_FLOOR_ASPECT = 0.5
+_MAX_FLOOR_ASPECT = 4.0
+
 
 def _order_corners(corners: list[Corner]) -> list[Corner]:
     """Sort 4 image-space points into [back-left, back-right, front-right, front-left].
@@ -37,9 +52,54 @@ def _order_corners(corners: list[Corner]) -> list[Corner]:
     return [back_left, back_right, front_right, front_left]
 
 
-def compute_stage_homography(corners: list[list[int]] | list[Corner]) -> list[list[float]] | None:
+def estimate_floor_aspect(
+    image_to_floor: "list[list[float]]",
+    frame_size: tuple[int, int],
+) -> float:
+    """Real-world width/depth ratio of the marked floor rectangle.
+
+    Assumes a pinhole camera with square pixels and the principal point at the
+    image centre and a typical phone focal length. G = inverse(H) maps floor
+    (u,v) to image and is proportional to K [W*r1, D*r2, t]; so
+    ||K^-1 g1|| / ||K^-1 g2|| = W / D. Clamped to a sane range."""
+    import numpy as np
+
+    w, h = frame_size
+    g = np.linalg.inv(np.asarray(image_to_floor, dtype=np.float64))
+    g1, g2 = g[:, 0], g[:, 1]
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    a1, b1, c1 = g1[0] - cx * g1[2], g1[1] - cy * g1[2], g1[2]
+    a2, b2, c2 = g2[0] - cx * g2[2], g2[1] - cy * g2[2], g2[2]
+    f = _DEFAULT_FOCAL_WIDTHS * w
+    n1 = np.sqrt((a1 / f) ** 2 + (b1 / f) ** 2 + c1 ** 2)
+    n2 = np.sqrt((a2 / f) ** 2 + (b2 / f) ** 2 + c2 ** 2)
+    if n2 < 1e-12:
+        return CANVAS_ASPECT
+    return float(min(max(n1 / n2, _MIN_FLOOR_ASPECT), _MAX_FLOOR_ASPECT))
+
+
+def _aspect_correction(floor_aspect: float) -> "list[list[float]]":
+    """Affine (3x3) that shrinks one axis of the stage about its centre so the
+    floor rectangle is drawn with its real proportions on the 16:9 canvas."""
+    kx = ky = 1.0
+    if floor_aspect >= CANVAS_ASPECT:
+        ky = CANVAS_ASPECT / floor_aspect  # wide floor: less depth on screen
+    else:
+        kx = floor_aspect / CANVAS_ASPECT  # deep floor: narrower on screen
+    return [[kx, 0.0, 0.5 * (1 - kx)], [0.0, ky, 0.5 * (1 - ky)], [0.0, 0.0, 1.0]]
+
+
+def compute_stage_homography(
+    corners: list[list[int]] | list[Corner],
+    frame_size: tuple[int, int] | None = None,
+) -> list[list[float]] | None:
     """Return a 3x3 homography (list of lists) mapping image px -> stage (x,y) in
     [0,1], or None if the corners are unusable (not exactly 4, or degenerate).
+
+    frame_size: (width, height) of the video. When given, the floor's real
+    aspect ratio is estimated and baked in, so the formation keeps true
+    proportions — without it the floor is stretched to fill the 16:9 canvas
+    whatever its shape (a square floor came out with depth squashed to 56%).
 
     Uses the standard 4-point DLT; solved with numpy so the result is a plain
     nested list that round-trips through JSON."""
@@ -78,11 +138,18 @@ def compute_stage_homography(corners: list[list[int]] | list[Corner]) -> list[li
         return None
     if not np.all(np.isfinite(h)):
         return None
-    return [
-        [float(h[0]), float(h[1]), float(h[2])],
-        [float(h[3]), float(h[4]), float(h[5])],
-        [float(h[6]), float(h[7]), 1.0],
-    ]
+    hm = np.array(
+        [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1.0]], dtype=np.float64
+    )
+    if frame_size is not None:
+        try:
+            aspect = estimate_floor_aspect(hm.tolist(), frame_size)
+        except np.linalg.LinAlgError:
+            aspect = None
+        if aspect is not None:
+            hm = np.asarray(_aspect_correction(aspect)) @ hm
+            hm /= hm[2, 2]
+    return [[float(v) for v in row] for row in hm]
 
 
 def project_to_stage(
@@ -122,10 +189,16 @@ def compute_rescue_affine(
     if not points:
         return 1.0, 0.0, 0.0
     lo, hi = STAGE_MARGIN, 1.0 - STAGE_MARGIN
-    min_x = min(p[0] for p in points)
-    max_x = max(p[0] for p in points)
-    min_y = min(p[1] for p in points)
-    max_y = max(p[1] for p in points)
+    xs = sorted(p[0] for p in points)
+    ys = sorted(p[1] for p in points)
+    # Bounds from the 1st-99th percentile once there are enough points: a
+    # handful of glitch frames (a tracked point that slid onto someone else,
+    # a bad foot estimate) used to set the bounds alone and rescale/shift the
+    # ENTIRE clip — observed shifting every dancer by 12% of the stage. Those
+    # few outliers just get clamped by the caller instead.
+    trim = int(len(xs) * 0.01) if len(xs) >= 100 else 0
+    min_x, max_x = xs[trim], xs[-1 - trim]
+    min_y, max_y = ys[trim], ys[-1 - trim]
     if min_x >= 0.0 and max_x <= 1.0 and min_y >= 0.0 and max_y <= 1.0:
         return 1.0, 0.0, 0.0  # everything already on-canvas — trust the quad
 

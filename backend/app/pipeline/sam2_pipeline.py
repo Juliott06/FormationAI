@@ -8,7 +8,11 @@ from typing import Callable
 from app.core.config import get_settings
 from app.pipeline.homography import compute_stage_homography, project_to_stage
 from app.pipeline.pose import normalize_stage_proxy
-from app.pipeline.processor import apply_stage_rescue, finalize_frames, inspect_video_file
+from app.pipeline.processor import (
+    apply_stage_rescue,
+    finalize_frames,
+    inspect_video_file,
+)
 from app.schemas.jobs import (
     CoordinateSpaceMetadata,
     DancerClick,
@@ -105,7 +109,9 @@ def process_video_with_sam2(
     if not clicks:
         raise ValueError("SAM2 pipeline requires at least one click")
 
-    homography = compute_stage_homography(stage_corners) if stage_corners else None
+    homography = compute_stage_homography(
+        stage_corners, (video_meta.width, video_meta.height)
+    ) if stage_corners else None
 
     # SAM2 server expects unique names per click — multi-click is a CoTracker-only
     # feature. Send the first occurrence per name.
@@ -156,7 +162,8 @@ def process_video_with_sam2(
         frames,
         fps=video_meta.fps,
         refit_y=not calibrated,
-        frame_height=video_meta.height,
+        dedup=False,
+        smooth=True,
     )
 
     frames_below_expected = sum(1 for f in frames if len(f.dancers) < expected)

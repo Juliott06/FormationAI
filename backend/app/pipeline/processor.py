@@ -8,7 +8,6 @@ from typing import Any, Callable
 
 logger = logging.getLogger("uvicorn.error")
 
-_MAX_REASONABLE_DISPLACEMENT_PX = 60.0
 
 from app.core.config import get_settings
 from app.pipeline.debug_video import DebugVideoRenderer
@@ -19,7 +18,11 @@ from app.pipeline.labels import (
     build_cooccurring_pairs as _labels_build_cooccurring,
 )
 from app.pipeline.named_matcher import match_names_to_yolo
-from app.pipeline.templates import fit_template, generate_templates_for_count
+from app.pipeline.templates import (
+    fit_template,
+    formation_spread,
+    generate_templates_for_count,
+)
 from app.pipeline.types import TrackedDetection
 from app.pipeline.yolo_detector import YoloPersonDetector
 from app.schemas.jobs import (
@@ -114,9 +117,31 @@ def _snap_formations_to_grid(
             d.y = round(round(d.y / grid_step) * grid_step, 6)
 
 
+# A 2-D shape (V, rows, grid, triangle) fitted with one axis squashed to
+# under this extent (stage units) has degenerated into a line — e.g. a V with
+# zero depth IS a line, and won on noise over the real "Line" template.
+_MIN_2D_EXTENT = 0.06
+
+
+def _collapsed_2d_shape(template_points, snapped) -> bool:
+    t_range = template_points.max(axis=0) - template_points.min(axis=0)
+    if (t_range < 1e-9).any():
+        return False  # genuinely 1-D template (Line / Vertical line)
+    s_range = snapped.max(axis=0) - snapped.min(axis=0)
+    return bool((s_range < _MIN_2D_EXTENT).any())
+
+
 def _snap_formations_to_templates(
-    formations: list[Formation], threshold: float
+    formations: list[Formation],
+    threshold: float,
+    relative_threshold: float = 0.25,
 ) -> None:
+    """Snap each formation to its best-fitting named shape when the fit is
+    good both absolutely (rmse <= threshold, stage units) and relative to the
+    formation's own size (rmse / spread <= relative_threshold). The relative
+    test stops a tight cluster from "matching" every template — with only an
+    absolute threshold, any formation smaller than ~0.1 stage units snapped
+    to whatever shape came out first."""
     if threshold <= 0:
         return
     import numpy as np
@@ -132,20 +157,29 @@ def _snap_formations_to_templates(
         best_name = None
         for tmpl in templates:
             snapped, rmse = fit_template(tmpl, observed)
+            if _collapsed_2d_shape(tmpl.points, snapped):
+                continue
             if rmse < best_rmse:
                 best_rmse = rmse
                 best_snapped = snapped
                 best_name = tmpl.name
-        if best_snapped is not None and best_rmse <= threshold:
+        spread = formation_spread(observed)
+        if (
+            best_snapped is not None
+            and best_rmse <= threshold
+            and spread > 1e-6
+            and best_rmse / spread <= relative_threshold
+        ):
             for i, d in enumerate(formation.dancers):
                 d.x = round(float(best_snapped[i, 0]), 6)
                 d.y = round(float(best_snapped[i, 1]), 6)
             formation.shape_name = best_name
             logger.info(
-                "formation %d snapped to %s (rmse=%.3f)",
+                "formation %d snapped to %s (rmse=%.3f, relative=%.2f)",
                 formation.index,
                 best_name,
                 best_rmse,
+                best_rmse / spread,
             )
 
 
@@ -201,12 +235,62 @@ def apply_stage_rescue(frames: list[FramePositions]) -> None:
             d.y = round(min(max(s * d.y + oy, 0.0), 1.0), 6)
 
 
+def smooth_trajectories(
+    frames: list[FramePositions], *, fps: float, window_sec: float = 0.3
+) -> None:
+    """Temporally smooth each dancer's stage (x, y) in place.
+
+    Per contiguous run of frames where the dancer is present: a 5-frame median
+    (removes single-frame spikes — a foot estimate from a jump or a wrong box)
+    followed by a centred moving average of ~window_sec. Without it the dots
+    jittered visibly and per-frame anchor noise read as movement, breaking
+    held formations apart. anchor_px is left raw."""
+    half = max(int(round(window_sec * max(fps, 1.0) / 2)), 1)
+    runs: dict[int, list[list[DancerPosition]]] = {}
+    last_seen: dict[int, int] = {}
+    for fi, f in enumerate(frames):
+        for d in f.dancers:
+            if last_seen.get(d.id) == fi - 1:
+                runs[d.id][-1].append(d)
+            else:
+                runs.setdefault(d.id, []).append([d])
+            last_seen[d.id] = fi
+
+    def _median5(vals: list[float]) -> list[float]:
+        out = []
+        for i in range(len(vals)):
+            w = sorted(vals[max(0, i - 2) : i + 3])
+            out.append(w[len(w) // 2])
+        return out
+
+    def _box(vals: list[float]) -> list[float]:
+        prefix = [0.0]
+        for v in vals:
+            prefix.append(prefix[-1] + v)
+        out = []
+        for i in range(len(vals)):
+            lo, hi = max(0, i - half), min(len(vals), i + half + 1)
+            out.append((prefix[hi] - prefix[lo]) / (hi - lo))
+        return out
+
+    for dancer_runs in runs.values():
+        for run in dancer_runs:
+            if len(run) < 3:
+                continue
+            xs = _box(_median5([d.x for d in run]))
+            ys = _box(_median5([d.y for d in run]))
+            for d, x, y in zip(run, xs, ys):
+                d.x = round(x, 6)
+                d.y = round(y, 6)
+
+
 def finalize_frames(
     frames: list[FramePositions],
     *,
     fps: float,
     refit_y: bool = True,
-    frame_height: int = 1080,
+    dedup: bool = True,
+    smooth: bool = False,
 ) -> "list[Formation]":
     """Shared post-processing tail: fill detection gaps, refit stage Y, segment
     into formations, and clean the formations up.
@@ -221,19 +305,27 @@ def finalize_frames(
     perspective. Pass False when x,y are already true top-down floor coords
     (a stage homography was applied) — refitting would re-distort them.
 
-    frame_height: source video height, used to normalize movement so the
-    formation threshold means the same thing at every resolution/fps."""
+    dedup: drop near-coincident dancers from formations. Only for automatic
+    tracking, where two IDs on one spot are usually one person split in two.
+    Click-tracked dancers are distinct people by construction — deduping them
+    made a dancer silently vanish from the formation whenever two stood close
+    (and the template fit then ran on the wrong dancer count).
+
+    smooth: temporally smooth each dancer's stage position (see
+    smooth_trajectories). Done after the y refit, which recomputes y from the
+    raw anchors and would otherwise discard it."""
     settings = get_settings()
     _interpolate_missing_dancers(frames, settings.interpolation_max_gap_frames)
     if refit_y:
         _refit_stage_y(frames)
+    if smooth:
+        smooth_trajectories(frames, fps=fps)
     formations = _segment_formations(
         frames,
         fps=fps,
-        movement_threshold_px=settings.formation_movement_threshold_px,
+        movement_threshold=settings.formation_movement_threshold,
         smoothing_window=settings.formation_smoothing_window,
         min_duration_sec=settings.formation_min_duration_sec,
-        frame_height=frame_height,
     )
     formations = _split_by_position_change(
         formations,
@@ -242,8 +334,13 @@ def finalize_frames(
         split_threshold=settings.formation_split_threshold,
     )
     _snap_formations_to_grid(formations, settings.formation_snap_grid_step)
-    _dedup_close_dancers_per_formation(formations, settings.formation_dedup_distance)
-    _snap_formations_to_templates(formations, settings.formation_template_snap_threshold)
+    if dedup:
+        _dedup_close_dancers_per_formation(formations, settings.formation_dedup_distance)
+    _snap_formations_to_templates(
+        formations,
+        settings.formation_template_snap_threshold,
+        settings.formation_template_snap_relative_threshold,
+    )
     return formations
 
 
@@ -252,16 +349,20 @@ def _rebuild_positions_result(
 ) -> PositionsResult:
     # If the job was calibrated, x,y are already true top-down coords — don't
     # re-apply the perspective-compensation stretch.
+    unique_ids = {d.id for f in new_frames for d in f.dancers}
+    expected = base.summary.expected_dancer_count
+    click_tracked = expected is not None and len(unique_ids) <= expected
     new_formations = finalize_frames(
         new_frames,
         fps=base.video.fps,
         refit_y=not base.stage_calibrated,
-        frame_height=base.video.height,
+        # Fragmented automatic tracks still need dedup; a click-tracked job
+        # (one ID per expected dancer) must keep every dancer.
+        dedup=not click_tracked,
+        smooth=click_tracked,
     )
 
-    unique_ids = {d.id for f in new_frames for d in f.dancers}
     counts = [len(f.dancers) for f in new_frames]
-    expected = base.summary.expected_dancer_count
     new_summary = DetectionSummary(
         expected_dancer_count=expected,
         unique_track_ids=len(unique_ids),
@@ -425,42 +526,50 @@ def _split_by_position_change(
     return result
 
 
-# Movement thresholds are expressed in px/frame at this reference format.
-# Measured movement is normalized to it so the same physical motion reads the
-# same number whether the upload is 720p@30fps or 1080p@24fps — otherwise the
-# threshold silently tightens on smaller/faster-fps videos (a 720p/30fps clip
-# produced ~54% of the px/frame of the 1080p/24fps clip the threshold was
-# tuned on, merging a whole song into one formation).
-_MOVEMENT_REF_HEIGHT = 1080.0
-_MOVEMENT_REF_FPS = 24.0
+# Movement is measured on the STAGE canvas (800x450 px, the size every view
+# draws), in canvas px per second, as each dancer's displacement across a
+# short window. Previously it was image-pixel motion of the anchor per frame:
+# far-away dancers move only a few image pixels per metre, so a whole back-row
+# walk could fall under the threshold, while per-frame anchor jitter (~4px on
+# synthetic tests) sat right under it. The windowed stage measure is
+# depth-independent and the window cancels frame-to-frame jitter.
+_STAGE_CANVAS_W = 800.0
+_STAGE_CANVAS_H = 450.0
+_MOVEMENT_WINDOW_SEC = 0.17  # half-width of the displacement window
 
 
 def _segment_formations(
     frames: list[FramePositions],
     fps: float,
     *,
-    movement_threshold_px: float,
+    movement_threshold: float,
     smoothing_window: int,
     min_duration_sec: float,
-    frame_height: int = 1080,
 ) -> list[Formation]:
+    """Split the clip into held formations: runs of frames whose average
+    dancer speed (stage canvas px/second) stays under movement_threshold."""
     if len(frames) < 2:
         return []
 
-    norm = (_MOVEMENT_REF_HEIGHT / max(frame_height, 1)) * (
-        max(fps, 1.0) / _MOVEMENT_REF_FPS
-    )
-    raw_movement: list[float] = [0.0]
-    for i in range(1, len(frames)):
-        prev_by_id = {d.id: d.anchor_px for d in frames[i - 1].dancers}
-        distances: list[float] = []
-        for d in frames[i].dancers:
-            if d.id in prev_by_id:
-                dx = d.anchor_px[0] - prev_by_id[d.id][0]
-                dy = d.anchor_px[1] - prev_by_id[d.id][1]
-                raw_dist = (dx * dx + dy * dy) ** 0.5 * norm
-                distances.append(min(raw_dist, _MAX_REASONABLE_DISPLACEMENT_PX))
-        raw_movement.append(sum(distances) / len(distances) if distances else float("inf"))
+    fps = max(fps, 1.0)
+    k = max(int(round(_MOVEMENT_WINDOW_SEC * fps)), 1)
+    by_frame = [{d.id: (d.x, d.y) for d in f.dancers} for f in frames]
+    raw_movement: list[float] = []
+    for i in range(len(frames)):
+        lo_i, hi_i = max(0, i - k), min(len(frames) - 1, i + k)
+        span = hi_i - lo_i
+        if span == 0:
+            raw_movement.append(float("inf"))
+            continue
+        before, after = by_frame[lo_i], by_frame[hi_i]
+        speeds: list[float] = []
+        for did, (x1, y1) in after.items():
+            if did not in before:
+                continue
+            x0, y0 = before[did]
+            dist = (((x1 - x0) * _STAGE_CANVAS_W) ** 2 + ((y1 - y0) * _STAGE_CANVAS_H) ** 2) ** 0.5
+            speeds.append(dist * fps / span)
+        raw_movement.append(sum(speeds) / len(speeds) if speeds else float("inf"))
 
     half = max(smoothing_window // 2, 1)
     smoothed: list[float] = []
@@ -484,25 +593,25 @@ def _segment_formations(
             f"max={finite[-1]:.1f}"
         )
 
-    below = sum(1 for v in smoothed if v < movement_threshold_px)
-    logger.info("formation movement raw      (px/frame): %s", _stats(raw_movement[1:]))
+    below = sum(1 for v in smoothed if v < movement_threshold)
+    logger.info("formation movement raw      (stage px/s): %s", _stats(raw_movement))
     logger.info(
-        "formation movement smoothed (px/frame): %s | %d/%d below threshold=%.1f",
+        "formation movement smoothed (stage px/s): %s | %d/%d below threshold=%.1f",
         _stats(smoothed),
         below,
         len(smoothed),
-        movement_threshold_px,
+        movement_threshold,
     )
 
     min_frame_count = max(int(round(fps * min_duration_sec)), 1)
     formations: list[Formation] = []
     i = 0
     while i < len(smoothed):
-        if smoothed[i] >= movement_threshold_px:
+        if smoothed[i] >= movement_threshold:
             i += 1
             continue
         start = i
-        while i < len(smoothed) and smoothed[i] < movement_threshold_px:
+        while i < len(smoothed) and smoothed[i] < movement_threshold:
             i += 1
         end = i - 1
         if (end - start + 1) < min_frame_count:
@@ -1081,7 +1190,7 @@ def process_video(
         advantage=settings.gradual_swap_advantage,
     )
     formations = finalize_frames(
-        frames, fps=video_meta.fps, frame_height=video_meta.height
+        frames, fps=video_meta.fps
     )
 
     total_frames = len(frames)

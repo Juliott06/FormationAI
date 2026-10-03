@@ -123,19 +123,24 @@ class LocalClient(CoTrackerClient):
                 f"invalid video dims {src_w}x{src_h} or frame count {n_frames}"
             )
 
-        scale = self._resize_width / src_w
         rw = self._resize_width
-        rh = max(int(round(src_h * scale)), 16)
+        rh = max(int(round(src_h * rw / src_w)), 16)
+        # Per-axis scale: rh is rounded, so a single scale would put y off by
+        # up to half a resized pixel (~1px in source space).
+        scale_x = rw / src_w
+        scale_y = rh / src_h
         logger.info(
             "CoTracker: video=%s src=%dx%d resize=%dx%d frames=%d clicks=%d",
             video_path.name, src_w, src_h, rw, rh, n_frames, len(clicks),
         )
 
         queries: list[list[float]] = []
+        key_frames: list[int] = []
         for click in clicks:
             kf = int(click.get("key_frame", 0))
-            qx = float(click["x"]) * scale
-            qy = float(click["y"]) * scale
+            key_frames.append(kf)
+            qx = float(click["x"]) * scale_x
+            qy = float(click["y"]) * scale_y
             queries.append([float(kf), qx, qy])
         queries_tensor = torch.tensor(queries, dtype=torch.float32).unsqueeze(0)
 
@@ -222,18 +227,24 @@ class LocalClient(CoTrackerClient):
                 f"unexpected track count {final_tracks.shape[2]} for {N} queries"
             )
 
-        inv_scale = 1.0 / scale
         tracks_np = final_tracks[0].numpy()
         vis_np = final_vis[0].numpy()
         result: list[list[TrackedPoint]] = []
         for ni in range(N):
             points: list[TrackedPoint] = []
+            kf = key_frames[ni]
             for ti in range(actual_T):
                 xr = float(tracks_np[ti, ni, 0])
                 yr = float(tracks_np[ti, ni, 1])
-                v = float(vis_np[ti, ni])
-                x_src = int(round(xr * inv_scale))
-                y_src = int(round(yr * inv_scale))
+                # The online model only tracks FORWARD from the query frame.
+                # Before it, the output is just the query coords (or drift
+                # from them) and the visibility head is untrained there, so
+                # those frames are never real observations — previously they
+                # rendered every dancer frozen at their click spot for the
+                # whole pre-key-frame stretch.
+                v = float(vis_np[ti, ni]) if ti >= kf else 0.0
+                x_src = int(round(xr / scale_x))
+                y_src = int(round(yr / scale_y))
                 x_src = max(0, min(src_w - 1, x_src))
                 y_src = max(0, min(src_h - 1, y_src))
                 points.append(
