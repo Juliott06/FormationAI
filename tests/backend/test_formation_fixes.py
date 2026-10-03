@@ -153,7 +153,9 @@ def test_support_points_added_inside_matched_box():
 def test_support_point_not_duplicated_on_existing_click():
     clicks = [DancerClick(name="D", x=500, y=338)]  # already on the chest
     out = add_support_points(clicks, {"D": (450, 250, 100, 300)}, _meta())
-    assert len(out) == 2
+    assert len(out) == 3  # an alternate spot replaces the duplicate
+    ys = sorted(c.y for c in out)
+    assert all(b - a >= 24 for a, b in zip(ys, ys[1:]))
 
 
 def test_support_points_skipped_when_box_centre_far_from_click():

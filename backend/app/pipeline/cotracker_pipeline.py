@@ -232,12 +232,16 @@ def _key_frame_boxes(
 
 
 # Auto support points, as fractions of the dancer's key-frame box height
-# measured from the top: upper chest and hips, on the box's vertical centre
-# line. Tracked alongside the user's click(s); per frame the median of the
-# visible points is used, so one point sliding onto a neighbour during a
-# crossing (the classic CoTracker failure) is outvoted instead of dragging
-# the dancer's dot across the stage.
-_SUPPORT_POINT_FRACTIONS = (0.30, 0.55)
+# measured from the top, on the box's vertical centre line. Tracked alongside
+# the user's click(s); per frame the median of the visible points is used, so
+# one point sliding onto a neighbour during a crossing (the classic CoTracker
+# failure) is outvoted instead of dragging the dancer's dot across the stage.
+# Candidates in preference order (chest, hips, then alternates used when a
+# preferred spot duplicates a user click); _SUPPORT_POINTS_PER_DANCER are
+# added so a single-click dancer ends up with 3 points — an odd count, so the
+# median is a real vote.
+_SUPPORT_POINT_FRACTIONS = (0.30, 0.55, 0.43, 0.20)
+_SUPPORT_POINTS_PER_DANCER = 2
 
 
 def add_support_points(
@@ -258,12 +262,16 @@ def add_support_points(
         xs = sorted(ex for ex, _ in existing)
         if xs and abs(xs[len(xs) // 2] - cx) > 0.3 * bw:
             continue
+        added = 0
         for frac in _SUPPORT_POINT_FRACTIONS:
+            if added >= _SUPPORT_POINTS_PER_DANCER:
+                break
             py = min(max(int(round(by + frac * bh)), 0), video_meta.height - 1)
             if any(abs(ex - cx) < 0.08 * bh and abs(ey - py) < 0.08 * bh for ex, ey in existing):
                 continue
             out.append(DancerClick(name=name, x=cx, y=py))
             existing.append((cx, py))
+            added += 1
     return out
 
 
