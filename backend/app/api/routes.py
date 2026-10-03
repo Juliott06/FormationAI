@@ -288,10 +288,12 @@ def submit_clicks(
     except JobNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
-    if job.status not in ("awaiting_clicks", "failed"):
+    # "completed" is allowed so a finished job can be re-run with extra
+    # identity-anchor clicks after the user spots a swap in the result.
+    if job.status not in ("awaiting_clicks", "failed", "completed"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Job {job_id} is in status '{job.status}'; clicks can only be set while awaiting_clicks.",
+            detail=f"Job {job_id} is in status '{job.status}'; clicks can't be changed while it is processing.",
         )
 
     fw, fh = job.video_meta.width, job.video_meta.height
@@ -305,6 +307,17 @@ def submit_clicks(
     # the same dancer (e.g. head + torso). The CoTracker pipeline groups by
     # name and emits a dancer position if ANY of their points is visible per
     # frame; the SAM2 pipeline uses the first occurrence per name.
+    for click in request.clicks:
+        if click.frame is not None and not (
+            request.key_frame <= click.frame < job.video_meta.frame_count
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Click frame {click.frame} must be between key_frame "
+                    f"{request.key_frame} and the last frame"
+                ),
+            )
     if request.key_frame >= job.video_meta.frame_count:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

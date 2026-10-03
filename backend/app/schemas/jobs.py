@@ -28,8 +28,18 @@ class DancerRosterEntry(BaseModel):
 
 class DancerClick(BaseModel):
     name: str = Field(min_length=1, max_length=64)
-    x: int = Field(ge=0, description="X pixel coordinate in the key frame")
-    y: int = Field(ge=0, description="Y pixel coordinate in the key frame")
+    x: int = Field(ge=0, description="X pixel coordinate in the click's frame")
+    y: int = Field(ge=0, description="Y pixel coordinate in the click's frame")
+    frame: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Frame this click was made on. Omitted = the request's key_frame. A "
+            "click on a LATER frame is an identity anchor: on that frame the "
+            "dancer is pinned to the person under the click (use it to fix a "
+            "swap after a crossing)."
+        ),
+    )
 
 
 def unique_click_names(clicks: list[DancerClick]) -> list[str]:

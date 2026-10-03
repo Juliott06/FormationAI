@@ -120,6 +120,65 @@ def _invert(m) -> list[list[float]]:
     return (inv / inv[2, 2]).tolist()
 
 
+class _HistAppearance:
+    """Colour histograms of hair / top / pants. Fallback when the ReID model
+    is unavailable."""
+
+    name = "colour histograms"
+
+    def features(self, frame, boxes: list[Box]) -> list:
+        return [appearance_feature(frame, b) for b in boxes]
+
+    def cost(self, template, feat) -> float:
+        return _W_APPEAR * appearance_distance(template, feat)
+
+    def blend(self, template, feat, rate: float):
+        return (1 - rate) * template + rate * feat
+
+
+class _ReIDAppearance:
+    """OSNet person re-identification embeddings (see pipeline/reid.py).
+    On the real 7-dancer clip, matching boxes to dancers by this alone got
+    14/15 labelled boxes right vs 10/15 for colour histograms."""
+
+    name = "OSNet ReID"
+    # Same-person cosine distance ~0.34, different-person ~0.43 on real
+    # footage: a small but consistent gap, so it gets a steep weight above a
+    # floor that same-person matches typically sit under.
+    _FLOOR = 0.25
+    _WEIGHT = 5.0
+
+    def __init__(self) -> None:
+        from app.pipeline.reid import embed, load_model
+
+        load_model()
+        self._embed = embed
+
+    def features(self, frame, boxes: list[Box]) -> list:
+        return list(self._embed(frame, boxes))
+
+    def cost(self, template, feat) -> float:
+        import numpy as np
+
+        d = 1.0 - float(np.dot(template, feat))
+        return self._WEIGHT * max(0.0, d - self._FLOOR)
+
+    def blend(self, template, feat, rate: float):
+        import numpy as np
+
+        t = (1 - rate) * template + rate * feat
+        return t / max(float(np.linalg.norm(t)), 1e-9)
+
+
+def make_appearance(use_reid: bool):
+    if use_reid:
+        try:
+            return _ReIDAppearance()
+        except Exception:
+            logger.exception("ReID model unavailable — using colour histograms for identity")
+    return _HistAppearance()
+
+
 def _iou(a: Box, b: Box) -> float:
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -170,6 +229,7 @@ def assign_detections(
     feats: list,
     point_positions: dict[int, tuple[float, float]],
     trusted: list[bool],
+    appearance=None,
 ):
     """Hungarian assignment of boxes to dancers. Returns {dancer_index: box_index}."""
     import numpy as np
@@ -177,6 +237,7 @@ def assign_detections(
 
     if not dancers or not boxes:
         return {}
+    appearance = appearance or _HistAppearance()
     big = 1e6
     cost = np.full((len(dancers), len(boxes)), big)
     for di, d in enumerate(dancers):
@@ -191,7 +252,7 @@ def assign_detections(
             motion = ((fx - px) ** 2 + (fy - py) ** 2) ** 0.5 / ref_h
             if motion > gate:
                 continue
-            app = 0.5 * appearance_distance(d.template_key, feat) + 0.5 * appearance_distance(
+            app = 0.5 * appearance.cost(d.template_key, feat) + 0.5 * appearance.cost(
                 d.template, feat
             )
             if pts:
@@ -199,7 +260,7 @@ def assign_detections(
             else:
                 vote = 0.5
             scale = abs(float(np.log(max(h, 1) / ref_h)))
-            c = _W_MOTION * min(motion, _MOTION_CAP) + _W_APPEAR * app + _W_POINTS * (1 - vote) + _W_SCALE * scale
+            c = _W_MOTION * min(motion, _MOTION_CAP) + app + _W_POINTS * (1 - vote) + _W_SCALE * scale
             if c <= _MAX_COST:
                 cost[di, bi] = c
     rows, cols = linear_sum_assignment(cost)
@@ -216,7 +277,14 @@ def run_identity_tracking(
     detector: _Detector,
     detect_every: int = 1,
     compensate_camera: bool = True,
+    use_reid: bool = True,
+    anchors: dict[int, dict[str, Box]] | None = None,
 ) -> IdentityResult:
+    """anchors: {frame: {dancer: box}} from user clicks on later frames. On an
+    anchor frame the dancer is pinned to that person (overriding the
+    automatic assignment) and her appearance template is refreshed — the
+    user's way to fix a swap the automatic matching got wrong. A dancer
+    first clicked on a later frame (not on the key frame) starts there."""
     import cv2
 
     from app.pipeline.camera_motion import CameraMotionEstimator, apply_h, camera_is_moving
@@ -231,6 +299,7 @@ def run_identity_tracking(
     raw_samples: list[tuple[int, float, float, float]] = []
     reassigned = 0
     estimator = None
+    appearance = make_appearance(use_reid)
 
     dancers: list[_Dancer] = []
     for n in names:
@@ -278,13 +347,12 @@ def run_identity_tracking(
                     point_pos[i] = (float(tr[fi].x), float(tr[fi].y))
 
             if fi == key_frame and frame is not None:
-                for d in dancers:
-                    box = key_boxes.get(d.name)
-                    if box is None:
-                        continue
-                    feat = appearance_feature(frame, box)
+                named = [d for d in dancers if d.name in key_boxes]
+                key_feats = appearance.features(frame, [key_boxes[d.name] for d in named])
+                for d, feat in zip(named, key_feats):
                     d.template_key = feat
                     d.template = feat.copy()
+                for d in dancers:
                     for i in d.point_idx:
                         if i in point_pos:
                             d.offsets[i] = (d.foot[0] - point_pos[i][0], d.foot[1] - point_pos[i][1])
@@ -311,11 +379,52 @@ def run_identity_tracking(
             if frame is not None:
                 boxes = [det.bbox for det in detector.detect(frame)]
                 last_boxes = boxes
-                feats = [appearance_feature(frame, b) for b in boxes]
-                ready = [d for d in dancers if d.template_key is not None]
-                ready_idx = [di for di, d in enumerate(dancers) if d.template_key is not None]
-                sub = assign_detections(ready, boxes, feats, point_pos, trusted)
-                assignment = {ready_idx[k]: v for k, v in sub.items()}
+                feats = appearance.features(frame, boxes)
+                # User anchors on this frame are certain: pin them first.
+                forced: dict[int, int] = {}
+                for name, abox in (anchors or {}).get(fi, {}).items():
+                    di = next((k for k, d in enumerate(dancers) if d.name == name), None)
+                    if di is None or not boxes:
+                        continue
+                    bi = max(range(len(boxes)), key=lambda j: _iou(abox, boxes[j]))
+                    if _iou(abox, boxes[bi]) < 0.3 or bi in forced.values():
+                        continue
+                    forced[di] = bi
+                    d = dancers[di]
+                    feat = feats[bi]
+                    if d.template_key is None:
+                        d.template_key = feat
+                        d.template = feat.copy() if hasattr(feat, "copy") else feat
+                    else:
+                        d.template_key = appearance.blend(d.template_key, feat, 0.3)
+                        d.template = appearance.blend(d.template, feat, 0.5)
+                    x, y, w, h = boxes[bi]
+                    d.foot = (x + w / 2.0, float(y + h))
+                    d.vel = (0.0, 0.0)
+                    d.h = float(h)
+                    # Her points outside the anchored person are latched onto
+                    # someone else: stop trusting them now.
+                    for i in d.point_idx:
+                        if i in point_pos and not _inside(*point_pos[i], (x, y, w, h), 0.0):
+                            if trusted[i]:
+                                trusted[i] = False
+                                defect_at[i] = fi
+                taken = set(forced.values())
+                free_boxes = [j for j in range(len(boxes)) if j not in taken]
+                ready_idx = [
+                    di for di, d in enumerate(dancers)
+                    if d.template_key is not None and di not in forced
+                ]
+                sub = assign_detections(
+                    [dancers[di] for di in ready_idx],
+                    [boxes[j] for j in free_boxes],
+                    [feats[j] for j in free_boxes],
+                    point_pos,
+                    trusted,
+                    appearance,
+                )
+                assignment = {ready_idx[k]: free_boxes[v] for k, v in sub.items()}
+                assignment.update(forced)
 
                 # Point defection: a trusted point sitting inside another
                 # dancer's assigned box (and not its own) for several frames.
@@ -367,8 +476,9 @@ def run_identity_tracking(
                     )
                     if clean:
                         raw_samples.append((fi, x + w / 2.0, float(y), fy))
-                        feat = appearance_feature(frame, (x, y, w, h))
-                        d.template = (1 - _TEMPLATE_RATE) * d.template + _TEMPLATE_RATE * feat
+                        d.template = appearance.blend(
+                            d.template, feats[assignment[di]], _TEMPLATE_RATE
+                        )
                     feet[d.name][fi] = (int(round(fx)), int(round(fy)))
                     continue
 
@@ -441,6 +551,7 @@ def run_identity_tracking(
     defected = sum(1 for t in trusted if not t)
     if moving:
         logger.info("identity: camera pans/zooms — positions compensated to the key-frame view")
+    logger.info("identity: appearance model = %s", appearance.name)
     logger.info(
         "identity: %d dancers, %d points defected (ignored after latching onto "
         "someone else), %d re-acquisitions after occlusion, %d clean box samples",

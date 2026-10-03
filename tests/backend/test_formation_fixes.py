@@ -384,10 +384,70 @@ def test_identity_recovers_dancer_whose_points_latched_onto_occluder(tmp_path):
             return [Detection(bbox=b, anchor_px=(b[0] + b[2] // 2, b[1] + b[3]), confidence=0.9)
                     for b in bx.values()]
 
-    res = run_identity_tracking(video, [track_a, track_b], ["A", "B"], 0, boxes_at(0), detector=Det())
+    res = run_identity_tracking(
+        video, [track_a, track_b], ["A", "B"], 0, boxes_at(0), detector=Det(), use_reid=False
+    )
     for t in (45, 55):
         ax, ay, aw, ah = boxes_at(t)["A"]
         fa = res.feet["A"][t]
         assert fa is not None and abs(fa[0] - (ax + aw // 2)) <= aw // 2
     assert res.defected_points >= 1
     assert not res.tracks[0][55].visible  # latched point ignored
+
+
+def test_identity_anchor_pins_dancer_to_clicked_person(tmp_path):
+    """Two identically dressed people swap places; appearance can't tell them
+    apart and both point tracks follow the wrong person after the crossing.
+    A user anchor click on A after the crossing must put A back on A."""
+    import cv2
+
+    from app.pipeline.identity import run_identity_tracking
+
+    n, W, H = 60, 400, 240
+    def boxes_at(t):
+        ax = int(60 + 4 * t)
+        bx = int(300 - 4 * t)
+        return {"A": (ax, 60, 40, 120), "B": (bx, 60, 40, 120)}
+    video = tmp_path / "x.avi"
+    vw = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 24.0, (W, H))
+    for t in range(n):
+        img = np.full((H, W, 3), 30, np.uint8)
+        for x, y, w, h in boxes_at(t).values():
+            cv2.rectangle(img, (x, y), (x + w, y + h), (40, 40, 220), -1)  # same colour
+        vw.write(img)
+    vw.release()
+
+    def point(t, name):
+        x, y, w, h = boxes_at(t)[name]
+        return TrackedPoint(t, x + w // 2, y + h // 3, True)
+    # After the crossing each track follows the OTHER person (a swap).
+    track_a = [point(t, "A") if t < 30 else point(t, "B") for t in range(n)]
+    track_b = [point(t, "B") if t < 30 else point(t, "A") for t in range(n)]
+
+    class Det:
+        def __init__(self):
+            self.t = 0
+        def detect(self, frame):
+            bx = boxes_at(self.t)
+            self.t += 1
+            return [Detection(bbox=b, anchor_px=(0, 0), confidence=0.9) for b in bx.values()]
+
+    res = run_identity_tracking(
+        video, [track_a, track_b], ["A", "B"], 0, boxes_at(0), detector=Det(),
+        use_reid=False, anchors={40: {"A": boxes_at(40)["A"], "B": boxes_at(40)["B"]}},
+    )
+    for t in (45, 55):
+        for name in ("A", "B"):
+            x, y, w, h = boxes_at(t)[name]
+            f = res.feet[name][t]
+            assert f is not None and x <= f[0] <= x + w, (t, name, f)
+
+
+def test_anchor_click_frame_validated_by_api(tmp_path, monkeypatch):
+    from app.schemas.jobs import ClickSeedRequest
+
+    req = ClickSeedRequest(
+        key_frame=5,
+        clicks=[{"name": "A", "x": 1, "y": 2}, {"name": "A", "x": 3, "y": 4, "frame": 50}],
+    )
+    assert req.clicks[0].frame is None and req.clicks[1].frame == 50

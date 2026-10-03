@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     # after occlusions. 1 = every frame (best); 2 halves the detector cost.
     identity_tracking: bool = True
     identity_detect_every: int = 1
+    # Appearance cue for identity: OSNet person re-identification embeddings
+    # (pipeline/reid.py; ~0.1s/frame on CPU). False = colour histograms.
+    identity_reid: bool = True
 
     model_config = SettingsConfigDict(
         env_prefix="FORMATIONAI_",

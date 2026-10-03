@@ -104,9 +104,14 @@ def tracked_points_to_frames(
     foot_offset_per_click: dict[int, int] = {}
     for name in unique_names:
         click_idxs = name_to_indices[name]
-        foot_y_at_keyframe = max(clicks[ci].y for ci in click_idxs)
+        # Clicks on different frames (identity anchors) are different poses;
+        # the lowest click is only a foot guess within ONE frame.
+        lowest_by_frame: dict[int | None, int] = {}
         for ci in click_idxs:
-            foot_offset_per_click[ci] = foot_y_at_keyframe - clicks[ci].y
+            fr = clicks[ci].frame
+            lowest_by_frame[fr] = max(lowest_by_frame.get(fr, clicks[ci].y), clicks[ci].y)
+        for ci in click_idxs:
+            foot_offset_per_click[ci] = lowest_by_frame[clicks[ci].frame] - clicks[ci].y
             if click_foot_offsets is not None and ci < len(click_foot_offsets):
                 measured = click_foot_offsets[ci]
                 if measured is not None:
@@ -233,6 +238,27 @@ def _key_frame_boxes(
     return out
 
 
+def _anchor_boxes(
+    video_path: Path,
+    anchor_clicks: list[DancerClick],
+    detector: YoloPersonDetector,
+) -> dict[int, dict[str, tuple[int, int, int, int]]]:
+    """Person box under each anchor click, on the anchor's own frame."""
+    by_frame: dict[int, dict[str, list[tuple[int, int]]]] = {}
+    for c in anchor_clicks:
+        by_frame.setdefault(int(c.frame), {}).setdefault(c.name, []).append((c.x, c.y))  # type: ignore[arg-type]
+    frames = _read_frames_sequential(video_path, list(by_frame))
+    out: dict[int, dict[str, tuple[int, int, int, int]]] = {}
+    for fi, named in by_frame.items():
+        frame = frames.get(fi)
+        if frame is None:
+            continue
+        matched = match_clicks_to_boxes(named, detector.detect(frame))
+        if matched:
+            out[fi] = matched
+    return out
+
+
 # Auto support points, as fractions of the dancer's key-frame box height
 # measured from the top, on the box's vertical centre line. Tracked alongside
 # the user's click(s); per frame the median of the visible points is used, so
@@ -320,8 +346,17 @@ def process_video_with_cotracker(
         )
 
     settings = get_settings()
+    # Clicks on the key frame seed the tracking; clicks on later frames are
+    # identity anchors (see DancerClick.frame).
+    clicks = [
+        c if c.frame is not None and c.frame != key_frame else c.model_copy(update={"frame": key_frame})
+        for c in clicks
+    ]
+    key_clicks = [c for c in clicks if c.frame == key_frame]
+    anchor_clicks = [c for c in clicks if c.frame != key_frame]
     detector = None
     key_boxes: dict[str, tuple[int, int, int, int]] = {}
+    anchors: dict[int, dict[str, tuple[int, int, int, int]]] = {}
     if settings.cotracker_foot_assist:
         detector = YoloPersonDetector(
             model_name=settings.yolo_model_name,
@@ -333,29 +368,52 @@ def process_video_with_cotracker(
             tracker_config=settings.tracker_config,
         )
         try:
-            key_boxes = _key_frame_boxes(video_path, key_frame, clicks, detector)
+            key_boxes = _key_frame_boxes(video_path, key_frame, key_clicks, detector)
             logger.info(
                 "CoTracker: matched %d/%d dancers to a person box at key frame %d",
-                len(key_boxes), len(unique_click_names(clicks)), key_frame,
+                len(key_boxes), len(unique_click_names(key_clicks)), key_frame,
             )
+            if anchor_clicks:
+                anchors = _anchor_boxes(video_path, anchor_clicks, detector)
+                logger.info(
+                    "CoTracker: %d identity anchor(s) on %d later frame(s), %d matched to a person box",
+                    len(anchor_clicks), len({c.frame for c in anchor_clicks}),
+                    sum(len(v) for v in anchors.values()),
+                )
         except Exception:
             logger.exception("key-frame person detection failed; continuing without it")
             key_boxes = {}
 
     track_clicks = list(clicks)
     if settings.cotracker_auto_points and key_boxes:
-        track_clicks = add_support_points(clicks, key_boxes, video_meta)
+        track_clicks = add_support_points(key_clicks, key_boxes, video_meta) + anchor_clicks
         logger.info(
             "CoTracker: added %d auto support points (%d user clicks)",
             len(track_clicks) - len(clicks), len(clicks),
         )
+    track_clicks = [
+        c if c.frame is not None else c.model_copy(update={"frame": key_frame})
+        for c in track_clicks
+    ]
+
+    def _box_for(c: DancerClick):
+        if c.frame is None or c.frame == key_frame:
+            return key_boxes.get(c.name)
+        return anchors.get(c.frame, {}).get(c.name)
+
     click_foot_offsets = [
-        (key_boxes[c.name][1] + key_boxes[c.name][3] - c.y) if c.name in key_boxes else None
+        (box[1] + box[3] - c.y) if (box := _box_for(c)) is not None else None
         for c in track_clicks
     ]
 
     click_payload = [
-        {"name": c.name, "key_frame": key_frame, "x": c.x, "y": c.y} for c in track_clicks
+        {
+            "name": c.name,
+            "key_frame": c.frame if c.frame is not None else key_frame,
+            "x": c.x,
+            "y": c.y,
+        }
+        for c in track_clicks
     ]
 
     client = build_client()
@@ -387,6 +445,8 @@ def process_video_with_cotracker(
                 key_boxes,
                 detector=detector,
                 detect_every=settings.identity_detect_every,
+                anchors=anchors,
+                use_reid=settings.identity_reid,
             )
             tracks = ident.tracks
             foot_anchors = ident.feet
