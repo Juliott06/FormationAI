@@ -29,11 +29,10 @@ class Settings(BaseSettings):
     # Deprecated (image px/frame); segmentation now uses
     # formation_movement_threshold. Kept so old .env files still load.
     formation_movement_threshold_px: float = 15.0
-    # Average dancer speed on the 800x450 stage canvas, px/second, below which
-    # the dancers count as holding a formation. ~25 px/s ≈ 0.4 m/s on a
-    # typical floor: slower than walking to a new spot, faster than grooving
-    # in place.
-    formation_movement_threshold: float = 25.0
+    # Average dancer speed relative to the group (shared drift down-weighted), in
+    # formation sizes (RMS radius) per second, below which the dancers count
+    # as holding a formation. Raised automatically above a clip's own jitter.
+    formation_movement_threshold: float = 0.25
     formation_smoothing_window: int = 9
     formation_min_duration_sec: float = 0.5
     formation_split_window_frames: int = 10

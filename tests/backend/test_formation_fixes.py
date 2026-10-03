@@ -220,19 +220,28 @@ def _frames_from_series(series: dict[int, list[tuple[float, float]]]) -> list[Fr
 
 
 def test_back_row_walk_splits_formations():
-    # Two dancers hold, then BOTH walk 0.25 stage-depth units back over 1.5s,
-    # then hold. The old image-pixel measure missed this kind of depth move.
+    # One dancer holds; the other walks 0.25 stage-depth units BACK over 1.5s,
+    # then both hold. The old image-pixel measure missed depth moves like this.
     hold, move = 48, 36
-    def path(x):
-        p = [(x, 0.3)] * hold
-        p += [(x, 0.3 + 0.25 * (k + 1) / move) for k in range(move)]
-        p += [(x, 0.55)] * hold
-        return p
-    frames = _frames_from_series({1: path(0.3), 2: path(0.7)})
-    forms = _segment_formations(frames, 24.0, movement_threshold=25.0, smoothing_window=9, min_duration_sec=0.5)
+    walker = [(0.7, 0.3)] * hold
+    walker += [(0.7, 0.3 + 0.25 * (k + 1) / move) for k in range(move)]
+    walker += [(0.7, 0.55)] * hold
+    frames = _frames_from_series({1: [(0.3, 0.3)] * len(walker), 2: walker})
+    forms = _segment_formations(frames, 24.0, movement_threshold=0.25, smoothing_window=9, min_duration_sec=0.5)
     assert len(forms) == 2
     assert forms[0].end_frame < hold + 6
     assert forms[1].start_frame > hold + move - 6
+
+
+def test_group_drifting_together_stays_one_formation():
+    # All three dancers slide slowly forward together while keeping their
+    # arrangement (constant in real choreography) — still one formation.
+    n = 120
+    def path(x, y):
+        return [(x, y - 0.06 * k / n) for k in range(n)]
+    frames = _frames_from_series({1: path(0.3, 0.6), 2: path(0.5, 0.5), 3: path(0.7, 0.6)})
+    forms = _segment_formations(frames, 24.0, movement_threshold=0.25, smoothing_window=9, min_duration_sec=0.5)
+    assert len(forms) == 1
 
 
 def test_smoothing_removes_jitter_and_spikes():

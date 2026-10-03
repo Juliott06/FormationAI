@@ -133,7 +133,7 @@ FORMATIONAI_YOLO_IMAGE_SIZE=1280           # YOLO detection resolution
 FORMATIONAI_YOLO_CONFIDENCE_THRESHOLD=0.20 # lower = more detections (+ more false positives)
 FORMATIONAI_TRACKER_CONFIG=botsort_reid.yaml
 FORMATIONAI_FORMATION_TEMPLATE_SNAP_THRESHOLD=0.08  # how aggressively to snap to clean shapes
-FORMATIONAI_FORMATION_MOVEMENT_THRESHOLD=25         # stage px/s below which dancers are "holding" a formation
+FORMATIONAI_FORMATION_MOVEMENT_THRESHOLD=0.25       # formation-sizes/s (relative to the group) below which dancers are "holding"
 ```
 
 The file has inline comments explaining every knob and why it's set where it is.

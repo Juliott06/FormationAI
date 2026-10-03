@@ -236,7 +236,7 @@ def apply_stage_rescue(frames: list[FramePositions]) -> None:
 
 
 def smooth_trajectories(
-    frames: list[FramePositions], *, fps: float, window_sec: float = 0.3
+    frames: list[FramePositions], *, fps: float, window_sec: float = 0.5
 ) -> None:
     """Temporally smooth each dancer's stage (x, y) in place.
 
@@ -527,8 +527,8 @@ def _split_by_position_change(
 
 
 # Movement is measured on the STAGE canvas (800x450 px, the size every view
-# draws), in canvas px per second, as each dancer's displacement across a
-# short window. Previously it was image-pixel motion of the anchor per frame:
+# draws) as each dancer's displacement across a short window, relative to the
+# group and normalized by the formation's size. Previously it was image-pixel motion of the anchor per frame:
 # far-away dancers move only a few image pixels per metre, so a whole back-row
 # walk could fall under the threshold, while per-frame anchor jitter (~4px on
 # synthetic tests) sat right under it. The windowed stage measure is
@@ -537,6 +537,7 @@ _STAGE_CANVAS_W = 800.0
 _STAGE_CANVAS_H = 450.0
 _MOVEMENT_WINDOW_SEC = 0.17  # half-width of the displacement window
 _NOISE_FLOOR_MARGIN = 1.8
+_GROUP_DRIFT_WEIGHT = 0.35
 _MAX_THRESHOLD_FRACTION_OF_P90 = 0.4
 
 
@@ -549,13 +550,31 @@ def _segment_formations(
     min_duration_sec: float,
 ) -> list[Formation]:
     """Split the clip into held formations: runs of frames whose average
-    dancer speed (stage canvas px/second) stays under movement_threshold."""
+    dancer speed RELATIVE TO THE GROUP (shared drift down-weighted), in
+    formation sizes per second, stays under movement_threshold."""
     if len(frames) < 2:
         return []
 
     fps = max(fps, 1.0)
     k = max(int(round(_MOVEMENT_WINDOW_SEC * fps)), 1)
     by_frame = [{d.id: (d.x, d.y) for d in f.dancers} for f in frames]
+    # Speeds are divided by the clip's typical formation size (median RMS
+    # radius in canvas px), making the threshold independent of how zoomed
+    # the stage is: the same choreography mapped through user corners vs the
+    # auto floor calibration differed ~3x in canvas px/s, and a fixed px
+    # threshold fragmented the zoomed one.
+    spreads: list[float] = []
+    for pos in by_frame:
+        if len(pos) < 2:
+            continue
+        mx = sum(x for x, _ in pos.values()) / len(pos)
+        my = sum(y for _, y in pos.values()) / len(pos)
+        spreads.append(
+            (sum(((x - mx) * _STAGE_CANVAS_W) ** 2 + ((y - my) * _STAGE_CANVAS_H) ** 2
+                 for x, y in pos.values()) / len(pos)) ** 0.5
+        )
+    spreads.sort()
+    size = max(spreads[len(spreads) // 2], 20.0) if spreads else 100.0
     raw_movement: list[float] = []
     for i in range(len(frames)):
         lo_i, hi_i = max(0, i - k), min(len(frames) - 1, i + k)
@@ -564,14 +583,27 @@ def _segment_formations(
             raw_movement.append(float("inf"))
             continue
         before, after = by_frame[lo_i], by_frame[hi_i]
-        speeds: list[float] = []
-        for did, (x1, y1) in after.items():
-            if did not in before:
-                continue
-            x0, y0 = before[did]
-            dist = (((x1 - x0) * _STAGE_CANVAS_W) ** 2 + ((y1 - y0) * _STAGE_CANVAS_H) ** 2) ** 0.5
-            speeds.append(dist * fps / span)
-        raw_movement.append(sum(speeds) / len(speeds) if speeds else float("inf"))
+        common = [did for did in after if did in before]
+        if not common:
+            raw_movement.append(float("inf"))
+            continue
+        # Down-weight the group's shared drift: dancers grooving forward or
+        # sideways together (constant in real choreography) shouldn't break a
+        # formation, but the whole shape travelling across the stage still
+        # should, so drift counts at _GROUP_DRIFT_WEIGHT instead of fully.
+        disp = [
+            ((after[did][0] - before[did][0]) * _STAGE_CANVAS_W,
+             (after[did][1] - before[did][1]) * _STAGE_CANVAS_H)
+            for did in common
+        ]
+        mx = sum(dx for dx, _ in disp) / len(disp) if len(disp) > 1 else 0.0
+        my = sum(dy for _, dy in disp) / len(disp) if len(disp) > 1 else 0.0
+        drift = (mx * mx + my * my) ** 0.5 * _GROUP_DRIFT_WEIGHT
+        speeds = [
+            (((dx - mx) ** 2 + (dy - my) ** 2) ** 0.5 + drift) * fps / span / size
+            for dx, dy in disp
+        ]
+        raw_movement.append(sum(speeds) / len(speeds))
 
     half = max(smoothing_window // 2, 1)
     smoothed: list[float] = []
@@ -587,12 +619,12 @@ def _segment_formations(
             return "n/a"
         n = len(finite)
         return (
-            f"min={finite[0]:.1f} "
-            f"p25={finite[min(int(0.25 * n), n - 1)]:.1f} "
-            f"p50={finite[min(int(0.50 * n), n - 1)]:.1f} "
-            f"p75={finite[min(int(0.75 * n), n - 1)]:.1f} "
-            f"p90={finite[min(int(0.90 * n), n - 1)]:.1f} "
-            f"max={finite[-1]:.1f}"
+            f"min={finite[0]:.2f} "
+            f"p25={finite[min(int(0.25 * n), n - 1)]:.2f} "
+            f"p50={finite[min(int(0.50 * n), n - 1)]:.2f} "
+            f"p75={finite[min(int(0.75 * n), n - 1)]:.2f} "
+            f"p90={finite[min(int(0.90 * n), n - 1)]:.2f} "
+            f"max={finite[-1]:.2f}"
         )
 
     # Adapt to this clip's noise floor: the quietest stretches are holds, so
@@ -607,9 +639,9 @@ def _segment_formations(
         adaptive = min(_NOISE_FLOOR_MARGIN * p20, _MAX_THRESHOLD_FRACTION_OF_P90 * p90)
         movement_threshold = max(movement_threshold, adaptive)
     below = sum(1 for v in smoothed if v < movement_threshold)
-    logger.info("formation movement raw      (stage px/s): %s", _stats(raw_movement))
+    logger.info("formation movement raw      (sizes/s): %s", _stats(raw_movement))
     logger.info(
-        "formation movement smoothed (stage px/s): %s | %d/%d below threshold=%.1f",
+        "formation movement smoothed (sizes/s): %s | %d/%d below threshold=%.2f",
         _stats(smoothed),
         below,
         len(smoothed),
