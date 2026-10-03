@@ -26,6 +26,7 @@ from app.pipeline.foot_assist import (
     representative_points,
 )
 from app.pipeline.homography import compute_stage_homography, project_to_stage
+from app.pipeline.identity import run_identity_tracking
 from app.pipeline.pose import normalize_stage_proxy
 from app.pipeline.processor import (
     apply_stage_rescue,
@@ -375,7 +376,26 @@ def process_video_with_cotracker(
     box_samples: list[tuple[float, float]] = [
         (float(by + bh), float(bh)) for (_bx, by, _bw, bh) in key_boxes.values()
     ]
-    if detector is not None:
+    if detector is not None and settings.identity_tracking and key_boxes:
+        try:
+            t1 = time.perf_counter()
+            ident = run_identity_tracking(
+                video_path,
+                tracks,
+                [c.name for c in track_clicks],
+                key_frame,
+                key_boxes,
+                detector=detector,
+                detect_every=settings.identity_detect_every,
+            )
+            tracks = ident.tracks
+            foot_anchors = ident.feet
+            box_samples.extend(ident.box_samples)
+            logger.info("identity tracking done in %.1fs", time.perf_counter() - t1)
+        except Exception:
+            logger.exception("identity tracking failed — falling back to foot assist")
+            foot_anchors = None
+    if detector is not None and foot_anchors is None:
         try:
             rep = representative_points(tracks, [c.name for c in track_clicks])
             initial_offsets: dict[str, tuple[int, int]] = {}

@@ -76,6 +76,12 @@ class Settings(BaseSettings):
     # dancers' apparent heights (see pipeline/auto_ground.py) instead of the
     # raw camera view.
     auto_ground_calibration: bool = True
+    # Identity correction (pipeline/identity.py): run the person detector on
+    # every Nth frame and keep each dancer on the right person using motion,
+    # appearance and point votes. Fixes dots swapping onto another dancer
+    # after occlusions. 1 = every frame (best); 2 halves the detector cost.
+    identity_tracking: bool = True
+    identity_detect_every: int = 1
 
     model_config = SettingsConfigDict(
         env_prefix="FORMATIONAI_",

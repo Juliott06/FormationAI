@@ -286,6 +286,8 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("../synthetic_out"))
     ap.add_argument("--key-frame", type=int, default=6)
     ap.add_argument("--no-corners", action="store_true")
+    ap.add_argument("--seed", type=int, default=1, help="simulated tracker failure seed")
+    ap.add_argument("--no-identity", action="store_true", help="disable identity correction")
     args = ap.parse_args()
     out: Path = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -318,7 +320,11 @@ def main() -> None:
             u, v, _ = project(floor_pt(x, z))
             corners.append([int(u + rng.uniform(-4, 4)), int(v + rng.uniform(-3, 3))])
 
-    cp.build_client = lambda: SimCoTracker(all_bodies)
+    from app.core.config import get_settings
+
+    if args.no_identity:
+        get_settings().identity_tracking = False
+    cp.build_client = lambda: SimCoTracker(all_bodies, seed=args.seed)
     cp.YoloPersonDetector = lambda **kw: SimDetector(all_bodies)  # type: ignore[assignment]
     result = cp.process_video_with_cotracker(
         job_id="synthetic",
@@ -363,11 +369,17 @@ def main() -> None:
     id_to_dancer = {i + 1: name_to_dancer[n] for i, n in enumerate(dict.fromkeys(c.name for c in clicks))}
     errs = []
     depth_errs = []
+    wrong_identity = 0
     for f in result.frames:
+        gts = {d: gt_stage(f.frame, d) for d in range(len(NAMES))}
         for dp in f.dancers:
-            gx, gy = gt_stage(f.frame, id_to_dancer[dp.id])
+            gx, gy = gts[id_to_dancer[dp.id]]
             errs.append(math.hypot((dp.x - gx) * 800, (dp.y - gy) * 450))
             depth_errs.append(abs(dp.y - gy) * 450)
+            # Identity error: the dot is nearer some OTHER dancer's true spot.
+            nearest = min(gts, key=lambda d: math.hypot((dp.x - gts[d][0]) * 800, (dp.y - gts[d][1]) * 450))
+            if nearest != id_to_dancer[dp.id]:
+                wrong_identity += 1
     errs_np = np.array(errs)
     summary = {
         "frames": len(result.frames),
@@ -380,6 +392,7 @@ def main() -> None:
         "stage_err_px_max": round(float(errs_np.max()), 1),
         "depth_err_px_median": round(float(np.median(depth_errs)), 1),
         "pct_dancer_frames_off_by_gt_40px": round(100 * float((errs_np > 40).mean()), 1),
+        "pct_dancer_frames_wrong_identity": round(100 * wrong_identity / max(len(errs), 1), 2),
         "floor_aspect_on_canvas": round(floor_aspect, 3),
         "floor_aspect_true": FLOOR_W / FLOOR_D,
         "true_holds": [(n, round(s / FPS, 1), round(e / FPS, 1)) for n, s, e in holds],

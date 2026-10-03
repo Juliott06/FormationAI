@@ -341,3 +341,53 @@ def test_centre_front_formation_is_named():
     f = _formation([(0.5, 0.35), (0.3, 0.55), (0.5, 0.56), (0.7, 0.55)])
     _snap_formations_to_templates([f], threshold=0.08)
     assert f.shape_name in ("Centre front", "Diamond")
+
+
+def test_identity_recovers_dancer_whose_points_latched_onto_occluder(tmp_path):
+    """Two differently dressed people cross; all of A's tracked points stick to
+    B afterwards (the real failure). Detection + appearance must keep A's
+    foot anchor on A's box, and A's latched points must be distrusted."""
+    import cv2
+
+    from app.pipeline.identity import run_identity_tracking
+
+    n, W, H = 60, 400, 240
+    def boxes_at(t):
+        ax = int(60 + 4 * t)  # A walks right
+        bx = int(300 - 4 * t)  # B walks left; they cross around t=30
+        return {"A": (ax, 60, 40, 120), "B": (bx, 60, 40, 120)}
+    colors = {"A": (40, 40, 220), "B": (40, 200, 40)}
+    video = tmp_path / "x.avi"
+    vw = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 24.0, (W, H))
+    for t in range(n):
+        img = np.full((H, W, 3), 30, np.uint8)
+        bx = boxes_at(t)
+        for name in ("A", "B"):  # B drawn last = in front
+            x, y, w, h = bx[name]
+            cv2.rectangle(img, (x, y), (x + w, y + h), colors[name], -1)
+        vw.write(img)
+    vw.release()
+
+    def point(t, name):
+        x, y, w, h = boxes_at(t)[name]
+        return TrackedPoint(t, x + w // 2, y + h // 3, True)
+    # A's point follows A until the crossing, then latches onto B.
+    track_a = [point(t, "A") if t < 30 else point(t, "B") for t in range(n)]
+    track_b = [point(t, "B") for t in range(n)]
+
+    class Det:
+        def __init__(self):
+            self.t = 0
+        def detect(self, frame):
+            bx = boxes_at(self.t)
+            self.t += 1
+            return [Detection(bbox=b, anchor_px=(b[0] + b[2] // 2, b[1] + b[3]), confidence=0.9)
+                    for b in bx.values()]
+
+    res = run_identity_tracking(video, [track_a, track_b], ["A", "B"], 0, boxes_at(0), detector=Det())
+    for t in (45, 55):
+        ax, ay, aw, ah = boxes_at(t)["A"]
+        fa = res.feet["A"][t]
+        assert fa is not None and abs(fa[0] - (ax + aw // 2)) <= aw // 2
+    assert res.defected_points >= 1
+    assert not res.tracks[0][55].visible  # latched point ignored
