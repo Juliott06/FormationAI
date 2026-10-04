@@ -451,3 +451,40 @@ def test_anchor_click_frame_validated_by_api(tmp_path, monkeypatch):
         clicks=[{"name": "A", "x": 1, "y": 2}, {"name": "A", "x": 3, "y": 4, "frame": 50}],
     )
     assert req.clicks[0].frame is None and req.clicks[1].frame == 50
+
+
+def test_glitch_removed_but_real_move_kept():
+    # 0.4s spike to the back (someone passing in front) must vanish; a real
+    # walk to a new spot must survive.
+    n = 150
+    ys = [0.4] * n
+    for k in range(60, 72):
+        ys[k] = 0.9  # 12-frame glitch
+    for k in range(100, n):
+        ys[k] = 0.4 + min((k - 100) / 24.0, 1.0) * 0.2  # real 1s move back by 0.2
+    frames = _frames_from_series({1: [(0.5, y) for y in ys]})
+    smooth_trajectories(frames, fps=24.0)
+    out = [f.dancers[0].y for f in frames]
+    assert max(out[50:90]) < 0.45
+    assert abs(out[-1] - 0.6) < 0.02
+
+
+def test_speed_is_capped():
+    n = 60
+    xs = [0.2] * 30 + [0.8] * 30  # teleport across the stage
+    frames = _frames_from_series({1: [(x, 0.5) for x in xs]})
+    smooth_trajectories(frames, fps=24.0)
+    out = [f.dancers[0].x * 800 for f in frames]
+    steps = [abs(b - a) for a, b in zip(out, out[1:])]
+    assert max(steps) <= 350 / 24.0 + 1e-6
+
+
+def test_hidden_feet_never_in_front_of_occluder():
+    from app.pipeline.identity import _bottom_hidden
+
+    back = (100, 100, 60, 150)  # bottom 250, cut off by the person in front
+    front = (90, 120, 80, 260)  # bottom 380
+    limit = _bottom_hidden(back, [back, front], 0, 720)
+    assert limit is not None and limit < 380
+    assert _bottom_hidden(back, [back], 0, 720) is None  # unobstructed
+    assert _bottom_hidden((100, 500, 60, 220), [(100, 500, 60, 220)], 0, 720) == float("inf")

@@ -96,6 +96,37 @@ def appearance_distance(a, b) -> float:
     return float(np.sqrt(max(0.0, 1.0 - float(np.sqrt(a * b).sum()) / 3.0)))
 
 
+_HIDDEN_HEIGHT_RATIO = 0.8  # box clearly cut short, not just a slight crouch
+
+
+def _bottom_hidden(box: Box, boxes: list[Box], own: int, frame_h: int) -> float | None:
+    """If the bottom of `box` is probably NOT her feet, return the lowest image
+    row her feet can be at; else None.
+
+    - Bottom touches the frame edge: feet are below the frame (no limit).
+    - Another person's box covers her lower body from in front (overlaps her
+      horizontally and reaches lower down the image): she stands BEHIND that
+      person, so her feet are above (further back than) theirs."""
+    x, y, w, h = box
+    bottom = y + h
+    limit: float | None = None
+    for j, (bx, by, bw, bh) in enumerate(boxes):
+        if j == own:
+            continue
+        overlap = min(x + w, bx + bw) - max(x, bx)
+        if overlap < 0.3 * w:
+            continue
+        front_bottom = by + bh
+        if front_bottom > bottom + 0.03 * h and by < bottom:
+            cap = front_bottom - 0.04 * bh
+            limit = cap if limit is None else min(limit, cap)
+    if limit is not None:
+        return limit
+    if bottom >= frame_h - 3:
+        return float("inf")
+    return None
+
+
 def _clamp_vel(vx: float, vy: float, h: float) -> tuple[float, float]:
     """Limit predicted speed: a coasting estimate must not run away (observed:
     a hidden dancer's prediction flew off-screen and then grabbed boxes on the
@@ -201,11 +232,17 @@ class _Dancer:
     foot: tuple[float, float]
     vel: tuple[float, float] = (0.0, 0.0)
     h: float = 100.0
+    # Full-body (standing) box height from unobstructed boxes — used to put
+    # the feet in the right place when the bottom of her box is hidden.
+    h_full: float = 0.0
     template_key: object = None
     template: object = None
     lost: int = 0
-    # point -> (dx, dy) from point to foot, measured when last matched
+    # point -> (dx, dy) from point to foot, measured when last matched.
+    # `offsets` lead to the raw box bottom (what matching compares against);
+    # `out_offsets` to the corrected feet (what goes on the stage).
     offsets: dict[int, tuple[float, float]] = field(default_factory=dict)
+    out_offsets: dict[int, tuple[float, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -315,7 +352,9 @@ def run_identity_tracking(
                 max((p.y for p in pts), default=0) + 100.0,
             )
             hh = 200.0
-        dancers.append(_Dancer(name=n, point_idx=idx, foot=foot, h=hh))
+        dancers.append(
+            _Dancer(name=n, point_idx=idx, foot=foot, h=hh, h_full=hh if n in key_boxes else 0.0)
+        )
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -356,6 +395,7 @@ def run_identity_tracking(
                     for i in d.point_idx:
                         if i in point_pos:
                             d.offsets[i] = (d.foot[0] - point_pos[i][0], d.foot[1] - point_pos[i][1])
+                            d.out_offsets[i] = d.offsets[i]
 
             # Track the camera BEFORE assigning: if it panned/zoomed since the
             # last frame, move every dancer's predicted position (and scale)
@@ -373,6 +413,7 @@ def run_identity_tracking(
                         d.foot = (nx, ny)
                         d.vel = (vx - nx, vy - ny)
                         d.h *= zoom
+                        d.h_full *= zoom
 
             assignment: dict[int, int] = {}
             boxes: list[Box] = []
@@ -402,6 +443,8 @@ def run_identity_tracking(
                     d.foot = (x + w / 2.0, float(y + h))
                     d.vel = (0.0, 0.0)
                     d.h = float(h)
+                    if d.h_full <= 0:
+                        d.h_full = float(h)
                     # Her points outside the anchored person are latched onto
                     # someone else: stop trusting them now.
                     for i in d.point_idx:
@@ -454,6 +497,29 @@ def run_identity_tracking(
                 if di in assignment:
                     x, y, w, h = boxes[assignment[di]]
                     fy = float(y + h)
+                    raw_fy = fy
+                    feet_limit = _bottom_hidden(
+                        boxes[assignment[di]], boxes, assignment[di], frame.shape[0]
+                    )
+                    hidden = feet_limit is not None
+                    if hidden and d.h_full > 0 and h < _HIDDEN_HEIGHT_RATIO * d.h_full:
+                        # Her feet are behind someone in front (or below the
+                        # frame edge): the box bottom is where she's cut off,
+                        # not where she stands — which put back-row dancers
+                        # "far back" whenever someone passed in front of them.
+                        # Feet = top of box + her full standing height, but
+                        # never in front of the person blocking her.
+                        fy = min(float(y) + d.h_full, feet_limit)
+                        fy = max(fy, raw_fy)
+                    elif not hidden:
+                        # Any box with visible feet teaches her height. It
+                        # must keep up as she walks toward/away from the
+                        # camera (her on-screen height changes), or a stale
+                        # height makes the correction fire wrongly.
+                        if d.h_full <= 0:
+                            d.h_full = float(h)
+                        else:
+                            d.h_full = 0.85 * d.h_full + 0.15 * h
                     inside_pts = [p for _, p in trusted_pts if _inside(p[0], p[1], (x, y, w, h))]
                     if inside_pts:
                         xs = sorted(p[0] for p in inside_pts)
@@ -462,15 +528,18 @@ def run_identity_tracking(
                         fx = x + w / 2.0
                     if d.lost > 0:
                         reassigned += 1
-                    nv = (fx - d.foot[0], fy - d.foot[1])
+                    # Matching state follows the RAW box bottom (that's what
+                    # candidate boxes are compared with); the stage gets fy.
+                    nv = (fx - d.foot[0], raw_fy - d.foot[1])
                     d.vel = _clamp_vel(0.5 * d.vel[0] + 0.5 * nv[0], 0.5 * d.vel[1] + 0.5 * nv[1], d.h)
-                    d.foot = (fx, fy)
+                    d.foot = (fx, raw_fy)
                     d.h = 0.8 * d.h + 0.2 * h
                     d.lost = 0
                     for i, p in trusted_pts:
-                        d.offsets[i] = (fx - p[0], fy - p[1])
-                    clean = all(
-                        _iou((x, y, w, h), b) < _CLEAN_IOU
+                        d.offsets[i] = (fx - p[0], raw_fy - p[1])
+                        d.out_offsets[i] = (fx - p[0], fy - p[1])
+                    clean = not hidden and all(
+                        _iou(boxes[assignment[di]], b) < _CLEAN_IOU
                         for bj, b in enumerate(boxes)
                         if bj != assignment[di]
                     )
@@ -490,6 +559,11 @@ def run_identity_tracking(
                     for i, p in trusted_pts
                     if i in d.offsets
                 ]
+                est_out = [
+                    (p[0] + d.out_offsets[i][0], p[1] + d.out_offsets[i][1])
+                    for i, p in trusted_pts
+                    if i in d.out_offsets
+                ]
                 px_, py_ = d.foot[0] + d.vel[0], d.foot[1] + d.vel[1]
                 if est:
                     xs = sorted(e[0] for e in est)
@@ -503,6 +577,9 @@ def run_identity_tracking(
                     nv = (fx - d.foot[0], fy - d.foot[1])
                     d.vel = _clamp_vel(0.5 * d.vel[0] + 0.5 * nv[0], 0.5 * d.vel[1] + 0.5 * nv[1], d.h)
                     d.foot = (fx, fy)
+                    if est_out:
+                        oys = sorted(e[1] for e in est_out)
+                        fy = oys[len(oys) // 2]
                     feet[d.name][fi] = (int(round(fx)), int(round(fy)))
                 else:
                     d.vel = (d.vel[0] * _VEL_DAMP, d.vel[1] * _VEL_DAMP)

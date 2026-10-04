@@ -235,17 +235,63 @@ def apply_stage_rescue(frames: list[FramePositions]) -> None:
             d.y = round(min(max(s * d.y + oy, 0.0), 1.0), 6)
 
 
+# Fastest believable stage movement, canvas px/second (800x450 canvas): about
+# half the stage width per second, a dancer sprinting to a new spot.
+_MAX_STAGE_SPEED = 350.0
+# Glitches shorter than about half this window are removed by the rolling
+# median; real moves to a new spot (monotonic) pass through it intact.
+_SPIKE_WINDOW_SEC = 1.0
+
+
+def _rolling_median(vals: list[float], half: int) -> list[float]:
+    out = []
+    for i in range(len(vals)):
+        w = sorted(vals[max(0, i - half) : i + half + 1])
+        out.append(w[len(w) // 2])
+    return out
+
+
+def _speed_limited(xs: list[float], ys: list[float], max_step: float) -> tuple[list[float], list[float]]:
+    """Clamp per-frame movement (canvas px) to max_step, run forward and
+    backward and averaged so a clamp doesn't drag the path late."""
+
+    def one_pass(order: list[int]) -> tuple[list[float], list[float]]:
+        ox, oy = list(xs), list(ys)
+        prev = order[0]
+        for i in order[1:]:
+            dx = (ox[i] - ox[prev]) * 800.0
+            dy = (oy[i] - oy[prev]) * 450.0
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist > max_step:
+                k = max_step / dist
+                ox[i] = ox[prev] + (ox[i] - ox[prev]) * k
+                oy[i] = oy[prev] + (oy[i] - oy[prev]) * k
+            prev = i
+        return ox, oy
+
+    n = len(xs)
+    fx, fy = one_pass(list(range(n)))
+    bx, by = one_pass(list(range(n - 1, -1, -1)))
+    return [(a + b) / 2 for a, b in zip(fx, bx)], [(a + b) / 2 for a, b in zip(fy, by)]
+
+
 def smooth_trajectories(
     frames: list[FramePositions], *, fps: float, window_sec: float = 0.5
 ) -> None:
-    """Temporally smooth each dancer's stage (x, y) in place.
+    """Make each dancer's stage path physically plausible, in place.
 
-    Per contiguous run of frames where the dancer is present: a 5-frame median
-    (removes single-frame spikes — a foot estimate from a jump or a wrong box)
-    followed by a centred moving average of ~window_sec. Without it the dots
-    jittered visibly and per-frame anchor noise read as movement, breaking
-    held formations apart. anchor_px is left raw."""
-    half = max(int(round(window_sec * max(fps, 1.0) / 2)), 1)
+    Per contiguous run of frames where the dancer is present:
+    1. ~1s rolling median — removes glitches that go out and come back, e.g.
+       a back-row dancer's dot shooting to the back for a few frames while
+       someone passes in front of her;
+    2. speed cap (_MAX_STAGE_SPEED) — nobody crosses half the stage in a
+       fraction of a second;
+    3. centred moving average of ~window_sec — removes residual jitter.
+    anchor_px is left raw."""
+    fps = max(fps, 1.0)
+    half = max(int(round(window_sec * fps / 2)), 1)
+    med_half = max(int(round(_SPIKE_WINDOW_SEC * fps / 2)), 1)
+    max_step = _MAX_STAGE_SPEED / fps
     runs: dict[int, list[list[DancerPosition]]] = {}
     last_seen: dict[int, int] = {}
     for fi, f in enumerate(frames):
@@ -255,13 +301,6 @@ def smooth_trajectories(
             else:
                 runs.setdefault(d.id, []).append([d])
             last_seen[d.id] = fi
-
-    def _median5(vals: list[float]) -> list[float]:
-        out = []
-        for i in range(len(vals)):
-            w = sorted(vals[max(0, i - 2) : i + 3])
-            out.append(w[len(w) // 2])
-        return out
 
     def _box(vals: list[float]) -> list[float]:
         prefix = [0.0]
@@ -277,8 +316,10 @@ def smooth_trajectories(
         for run in dancer_runs:
             if len(run) < 3:
                 continue
-            xs = _box(_median5([d.x for d in run]))
-            ys = _box(_median5([d.y for d in run]))
+            xs = _rolling_median([d.x for d in run], med_half)
+            ys = _rolling_median([d.y for d in run], med_half)
+            xs, ys = _speed_limited(xs, ys, max_step)
+            xs, ys = _box(xs), _box(ys)
             for d, x, y in zip(run, xs, ys):
                 d.x = round(x, 6)
                 d.y = round(y, 6)
